@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RightKeys
+Comment=Cross-platform key remapper for Linux and Windows
+Exec=rightkeys
+Icon=rightkeys
+Terminal=false
+Categories=Utility;
+Keywords=keyboard;remap;keymap;hotkey;
+StartupNotify=false

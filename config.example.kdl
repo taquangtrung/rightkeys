@@ -1,0 +1,94 @@
+// RightKeys example — a small cross-platform (Windows + Linux) config.
+//
+// One config serves both OSes: window actions are performed natively on each,
+// and `exec` takes per-OS program targets (windows= / linux=).
+//
+// Matching uses regex strings against the active window's identifier
+// (process name on Windows, X11 WM_CLASS on Linux).
+//
+// Combos use prefixes: C = Ctrl, M = Alt, S = Shift, s = Super/Win, Hyper = CapsLock.
+
+// Advisory only for now; tap-vs-hold is resolved structurally.
+settings timeout=1.0
+
+// CapsLock becomes the synthetic Hyper modifier (never emitted to the OS), so
+// the Hyper layer below stays clear of any real key or shortcut.
+modmap {
+    map from="capslock" to="left_hyper"
+}
+
+// Tap Alt for Esc, hold Alt as Alt (Escape without leaving the home row).
+multipurpose-modmap {
+    map key="left_alt" tap="esc" hold="left_alt"
+    map key="right_alt" tap="esc" hold="right_alt"
+}
+
+// Emacs / readline editing with a selection mark, everywhere except terminals
+// and editors that already provide these keys natively.
+keymap name="Emacs" application-not="Emacs|URxvt|Xfce4-terminal" {
+    // Selection mark: set it, then movement keys extend the selection.
+    bind "C-space" { selection "start"; }
+    // Cancel selection (passes the key through when nothing is marked).
+    bind "C-g" { selection "clear"; pass-through; }
+    bind "esc" { selection "clear"; pass-through; }
+
+    // Navigation (extends the selection while the mark is set).
+    bind "C-a" { keys "home" extend="selection"; }
+    bind "C-b" { keys "left" extend="selection"; }
+    bind "C-e" { keys "end" extend="selection"; }
+    bind "C-f" { keys "right" extend="selection"; }
+    bind "C-n" { keys "down" extend="selection"; }
+    bind "C-p" { keys "up" extend="selection"; }
+    bind "M-b" { keys "C-left" extend="selection"; }
+    bind "M-f" { keys "C-right" extend="selection"; }
+    bind "M-S-comma" { keys "C-home" extend="selection"; }
+    bind "M-S-dot" { keys "C-end" extend="selection"; }
+
+    // Delete and kill.
+    bind "C-d" { keys "delete"; selection "clear"; }
+    bind "M-d" { keys "C-delete"; selection "clear"; }
+    bind "M-backspace" { keys "C-backspace"; selection "clear"; }
+    bind "C-w" { keys "C-backspace"; selection "clear"; }
+    bind "C-k" { keys "S-end"; keys "C-x"; selection "clear"; }
+    bind "C-u" { keys "S-home"; keys "C-x"; selection "clear"; }
+}
+
+// Window-management layer on Hyper (CapsLock). These window actions are native
+// and identical on Windows and Linux.
+keymap name="Hyper layer" {
+    // CapsLock is now Hyper, so reach the real CapsLock via Hyper + backslash.
+    bind "Hyper-backslash" { keys "capslock"; }
+
+    // Tile to a screen half via the OS snap (Win+Arrow / Super+Arrow).
+    bind "Hyper-h" { keys "s-left"; }
+    bind "Hyper-j" { keys "s-down"; }
+    bind "Hyper-k" { keys "s-up"; }
+    bind "Hyper-l" { keys "s-right"; }
+
+    // Native window actions (work the same on both platforms).
+    bind "Hyper-c" { wm action="center"; }                  // centre, keep size
+    bind "Hyper-0" { wm action="maximize"; }
+    bind "Hyper-1" { wm action="preset" w=0.6 h=0.7; }      // centred 60% × 70%
+    bind "Hyper-2" { wm action="snap" to="top-left"; }      // pin to a corner
+    bind "Hyper-m" { wm action="minimize"; }
+    bind "Hyper-t" { wm action="always-on-top"; }           // toggle keep-above
+    bind "Hyper-n" { wm action="move-to-monitor" to="next"; }
+    bind "Hyper-backtick" { wm action="cycle-same-app" direction="forward"; }
+}
+
+// App launchers — one binding per combo, with per-OS program targets. A combo
+// that lists only one OS is skipped on the other.
+keymap name="Launchers" {
+    bind "s-M-b" { exec windows="brave.exe"  linux="brave-browser"; }   // Win+Alt+b
+    bind "s-M-t" { exec windows="wt.exe"     linux="xfce4-terminal"; }  // terminal
+    bind "s-M-e" { exec linux="emacs"; }                               // Linux only
+    // One bind, different action per OS: Windows opens the Start menu (a
+    // keystroke), Linux runs an app launcher.
+    bind "s-x" { keys windows="C-esc"; exec linux="rofi-launchpad.sh"; }
+}
+
+// Per-app keymap example: in browsers, make Alt+j/k scroll by page.
+keymap name="Browsers" application="(?i)brave|firefox|chrome|msedge" {
+    bind "M-j" { keys "page_down"; }
+    bind "M-k" { keys "page_up"; }
+}
