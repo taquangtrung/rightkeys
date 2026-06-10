@@ -377,6 +377,14 @@ mod tests {
     }
 
     #[test]
+    fn bundled_example_config_parses() {
+        // Guards the shipped example against grammar drift (e.g. the `+`
+        // separator and literal symbol key names).
+        let example = include_str!("../config.example.kdl");
+        lower_str(example).expect("config.example.kdl should parse");
+    }
+
+    #[test]
     fn lowers_modmap_and_keymap() {
         let config = lower_str(
             r#"
@@ -384,11 +392,11 @@ mod tests {
                 map from="capslock" to="left_hyper"
             }
             keymap name="global" {
-                bind "Hyper-left" { keys "s-left"; }
-                bind "C-a" { keys "home" extend="selection"; }
-                bind "C-k" {
-                    keys "S-end"
-                    keys "C-x"
+                bind "Hyper+left" { keys "s+left"; }
+                bind "C+a" { keys "home" extend="selection"; }
+                bind "C+k" {
+                    keys "S+end"
+                    keys "C+x"
                     selection "clear"
                 }
             }
@@ -400,7 +408,7 @@ mod tests {
         let keymap = &config.keymaps[0];
         assert_eq!(keymap.name, "global");
         assert_eq!(keymap.bindings.len(), 3);
-        let ck = keymap.bindings.get(&Combo::parse("C-k").unwrap()).unwrap();
+        let ck = keymap.bindings.get(&Combo::parse("C+k").unwrap()).unwrap();
         assert_eq!(ck.len(), 3);
     }
 
@@ -422,7 +430,7 @@ mod tests {
         let config = lower_str(
             r#"
             keymap application="Firefox|Brave" {
-                bind "M-l" { keys "C-l"; }
+                bind "M+l" { keys "C+l"; }
             }
             "#,
         )
@@ -442,10 +450,10 @@ mod tests {
         let config = lower_str(
             r#"
             keymap name="global" {
-                bind "Hyper-b" { exec "brave"; }
-                bind "Hyper-0" { wm action="maximize"; }
-                bind "Hyper-y" { wm action="adjust" dx=-30; }
-                bind "Hyper-6" { wm action="preset" w=0.6 h=0.75; }
+                bind "Hyper+b" { exec "brave"; }
+                bind "Hyper+0" { wm action="maximize"; }
+                bind "Hyper+y" { wm action="adjust" dx=-30; }
+                bind "Hyper+6" { wm action="preset" w=0.6 h=0.75; }
             }
             "#,
         )
@@ -453,16 +461,16 @@ mod tests {
         let bindings = &config.keymaps[0].bindings;
         assert_eq!(bindings.len(), 4);
 
-        let exec = bindings.get(&Combo::parse("Hyper-b").unwrap()).unwrap();
+        let exec = bindings.get(&Combo::parse("Hyper+b").unwrap()).unwrap();
         assert!(matches!(exec.as_slice(), [Step::Exec(p)] if p == "brave"));
 
-        let adjust = bindings.get(&Combo::parse("Hyper-y").unwrap()).unwrap();
+        let adjust = bindings.get(&Combo::parse("Hyper+y").unwrap()).unwrap();
         assert!(matches!(
             adjust.as_slice(),
             [Step::Window(WindowAction::Adjust { dx: -30, dy: 0, dw: 0, dh: 0 })]
         ));
 
-        let preset = bindings.get(&Combo::parse("Hyper-6").unwrap()).unwrap();
+        let preset = bindings.get(&Combo::parse("Hyper+6").unwrap()).unwrap();
         assert!(matches!(
             preset.as_slice(),
             [Step::Window(WindowAction::Preset { w, h, anchor: None })] if *w == 0.6 && *h == 0.75
@@ -471,7 +479,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_window_action() {
-        assert!(lower_str(r#"keymap { bind "Hyper-x" { wm action="fly"; } }"#).is_err());
+        assert!(lower_str(r#"keymap { bind "Hyper+x" { wm action="fly"; } }"#).is_err());
     }
 
     #[test]
@@ -479,12 +487,12 @@ mod tests {
         let config = lower_str(
             r#"
             keymap {
-                bind "Hyper-c" { wm action="center"; }
-                bind "Hyper-q" { wm action="corner" to="top-left"; }
-                bind "Hyper-a" { wm action="smart-tile" to="left"; }
-                bind "C-s-3" { wm action="workspace" to="3"; }
-                bind "C-M-s-3" { wm action="move-to-workspace" to="3"; }
-                bind "C-s-l" { wm action="workspace" to="next"; }
+                bind "Hyper+c" { wm action="center"; }
+                bind "Hyper+q" { wm action="corner" to="top-left"; }
+                bind "Hyper+a" { wm action="smart-tile" to="left"; }
+                bind "C+s+3" { wm action="workspace" to="3"; }
+                bind "C+M+s+3" { wm action="move-to-workspace" to="3"; }
+                bind "C+s+l" { wm action="workspace" to="next"; }
             }
             "#,
         )
@@ -492,27 +500,27 @@ mod tests {
         let b = &config.keymaps[0].bindings;
 
         assert!(matches!(
-            b.get(&Combo::parse("Hyper-c").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("Hyper+c").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::Center)]
         ));
         assert!(matches!(
-            b.get(&Combo::parse("Hyper-q").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("Hyper+q").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::Corner(Corner::TopLeft))]
         ));
         assert!(matches!(
-            b.get(&Combo::parse("Hyper-a").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("Hyper+a").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::SmartTile { side: Side::Left, .. })]
         ));
         assert!(matches!(
-            b.get(&Combo::parse("C-s-3").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("C+s+3").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::Workspace { target: Workspace::Index(3), move_window: false })]
         ));
         assert!(matches!(
-            b.get(&Combo::parse("C-M-s-3").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("C+M+s+3").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::Workspace { target: Workspace::Index(3), move_window: true })]
         ));
         assert!(matches!(
-            b.get(&Combo::parse("C-s-l").unwrap()).unwrap().as_slice(),
+            b.get(&Combo::parse("C+s+l").unwrap()).unwrap().as_slice(),
             [Step::Window(WindowAction::Workspace { target: Workspace::Next, move_window: false })]
         ));
     }
@@ -651,9 +659,9 @@ mod tests {
         let config = lower_str(&format!(
             r#"
             keymap {{
-                bind "a" {{ keys windows="C-a" linux="C-q" macos="s-q"; }}
-                bind "b" {{ keys "C-b"; }}
-                bind "c" {{ keys {other}="C-c"; }}
+                bind "a" {{ keys windows="C+a" linux="C+q" macos="s+q"; }}
+                bind "b" {{ keys "C+b"; }}
+                bind "c" {{ keys {other}="C+c"; }}
             }}
             "#
         ))
@@ -661,7 +669,7 @@ mod tests {
         let b = &config.keymaps[0].bindings;
 
         // Positional default applies on every OS.
-        let expected_b = Combo::parse("C-b").unwrap();
+        let expected_b = Combo::parse("C+b").unwrap();
         assert!(matches!(
             b.get(&Combo::parse("b").unwrap()).unwrap().as_slice(),
             [Step::Keys(c)] if *c == expected_b
@@ -670,9 +678,9 @@ mod tests {
         assert!(!b.contains_key(&Combo::parse("c").unwrap()));
         // The per-OS remap resolves to this host's value.
         let expected_a = match this {
-            "windows" => "C-a",
-            "macos" => "s-q",
-            _ => "C-q",
+            "windows" => "C+a",
+            "macos" => "s+q",
+            _ => "C+q",
         };
         let expected_a = Combo::parse(expected_a).unwrap();
         assert!(matches!(
@@ -708,19 +716,19 @@ mod tests {
         // A bind may pair a Windows-only `keys` with a Linux-only `exec`; only the
         // step for this OS survives, and the binding still applies.
         let config = lower_str(
-            r#"keymap { bind "s-x" { keys windows="C-esc"; exec linux="menu.sh"; } }"#,
+            r#"keymap { bind "s+x" { keys windows="C+esc"; exec linux="menu.sh"; } }"#,
         )
         .unwrap();
         let steps = config
             .keymaps[0]
             .bindings
-            .get(&Combo::parse("s-x").unwrap())
+            .get(&Combo::parse("s+x").unwrap())
             .unwrap()
             .as_slice();
         match std::env::consts::OS {
             "linux" => assert!(matches!(steps, [Step::Exec(p)] if p == "menu.sh")),
             "windows" => {
-                let esc = Combo::parse("C-esc").unwrap();
+                let esc = Combo::parse("C+esc").unwrap();
                 assert!(matches!(steps, [Step::Keys(c)] if *c == esc));
             }
             _ => {}

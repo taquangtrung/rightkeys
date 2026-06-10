@@ -679,7 +679,7 @@ mod tests {
             keymaps: vec![keymap(
                 "global",
                 AppMatcher::default(),
-                vec![("C-a", vec![Step::Keys(Combo::parse("home").unwrap())])],
+                vec![("C+a", vec![Step::Keys(Combo::parse("home").unwrap())])],
             )],
             ..Config::default()
         };
@@ -707,7 +707,7 @@ mod tests {
             keymaps: vec![keymap(
                 "browser",
                 AppMatcher::default(),
-                vec![("M-S-j", vec![Step::Keys(Combo::parse("down").unwrap())])],
+                vec![("M+S+j", vec![Step::Keys(Combo::parse("down").unwrap())])],
             )],
             ..Config::default()
         };
@@ -767,7 +767,7 @@ mod tests {
             keymaps: vec![keymap(
                 "g",
                 AppMatcher::default(),
-                vec![("C-f", vec![Step::WithMark(Combo::parse("right").unwrap())])],
+                vec![("C+f", vec![Step::WithMark(Combo::parse("right").unwrap())])],
             )],
             ..Config::default()
         };
@@ -802,8 +802,8 @@ mod tests {
                 "g",
                 AppMatcher::default(),
                 vec![
-                    ("C-space", vec![Step::SetMark(true)]),
-                    ("C-f", vec![Step::WithMark(Combo::parse("right").unwrap())]),
+                    ("C+space", vec![Step::SetMark(true)]),
+                    ("C+f", vec![Step::WithMark(Combo::parse("right").unwrap())]),
                 ],
             )],
             ..Config::default()
@@ -887,8 +887,8 @@ mod tests {
                 "global",
                 AppMatcher::default(),
                 vec![(
-                    "Hyper-left",
-                    vec![Step::Keys(Combo::parse("s-left").unwrap())],
+                    "Hyper+left",
+                    vec![Step::Keys(Combo::parse("s+left").unwrap())],
                 )],
             )],
             ..Config::default()
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn super_chord_emits_one_shot_not_held() {
-        // A WM-shortcut chord (Hyper-h -> C-M-s-S-h) must release its modifiers
+        // A WM-shortcut chord (Hyper+h -> C+M+s+S+h) must release its modifiers
         // immediately, so a shortcut the window manager fires off it sees a clean
         // modifier state. The chord is pressed and released on the press event,
         // and the physical release emits nothing.
@@ -924,8 +924,8 @@ mod tests {
                 "global",
                 AppMatcher::default(),
                 vec![(
-                    "Hyper-h",
-                    vec![Step::Keys(Combo::parse("C-M-s-S-h").unwrap())],
+                    "Hyper+h",
+                    vec![Step::Keys(Combo::parse("C+M+s+S+h").unwrap())],
                 )],
             )],
             ..Config::default()
@@ -958,7 +958,7 @@ mod tests {
             keymaps: vec![keymap(
                 "global",
                 AppMatcher::default(),
-                vec![("M-b", vec![Step::Keys(Combo::parse("C-left").unwrap())])],
+                vec![("M+b", vec![Step::Keys(Combo::parse("C+left").unwrap())])],
             )],
             ..Config::default()
         };

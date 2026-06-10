@@ -66,20 +66,20 @@ impl Modifier {
 // === Combo ===
 
 impl Combo {
-    /// Parse a combo string such as `C-M-Super-Shift-a` or `Hyper-left` or a
-    /// bare key like `home`. Tokens are `-`-separated; every token but the last
-    /// is a modifier, the last is the key.
+    /// Parse a combo string such as `C+M+s+S+a` or `Hyper+left` or a bare key
+    /// like `home`. Tokens are `+`-separated; every token but the last is a
+    /// modifier, the last is the key.
     pub fn parse(spec: &str) -> Result<Self> {
         let mut modifiers = BTreeSet::new();
-        let parts: Vec<&str> = spec.split('-').collect();
+        let parts: Vec<&str> = spec.split('+').collect();
         let (key_token, mod_tokens) = parts
             .split_last()
             .filter(|(last, _)| !last.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "invalid key combo {spec:?}: the key is missing. \
-                     '-' separates modifiers from the key, so write punctuation keys \
-                     by name, e.g. `S-s-minus` (not `S-s--`) or `S-s-equal` (not `S-s-=`)"
+                     '+' joins modifiers to the key, e.g. `C+a` or `C+S+-`, \
+                     or a bare key like `=`"
                 )
             })?;
         for token in mod_tokens {
@@ -96,8 +96,8 @@ impl Combo {
         let key = Key::parse(key_token).ok_or_else(|| {
             anyhow::anyhow!(
                 "invalid key combo {spec:?}: unknown key {key_token:?}. \
-                 Keys use evdev names (e.g. `a`, `enter`, `space`, `f5`); write symbols \
-                 by name too, e.g. `minus`, `equal`, `comma`, `slash`"
+                 Keys use their symbol or evdev name, e.g. `a`, `-`, `=`, `/`, \
+                 `enter`, `space`, `f5`"
             )
         })?;
         Ok(Combo { modifiers, key })
@@ -226,18 +226,18 @@ define_keys! {
     Right { names: ["right"], evdev: 106, vk: 0x27 },
     Up { names: ["up"], evdev: 103, vk: 0x26 },
 
-    // Punctuation
-    Apostrophe { names: ["apostrophe"], evdev: 40, vk: 0xDE },
-    Backslash { names: ["backslash"], evdev: 43, vk: 0xDC },
-    Comma { names: ["comma"], evdev: 51, vk: 0xBC },
-    Dot { names: ["dot"], evdev: 52, vk: 0xBE },
-    Equal { names: ["equal"], evdev: 13, vk: 0xBB },
-    Backtick { names: ["backtick"], evdev: 41, vk: 0xC0 },
-    LeftBrace { names: ["left_brace"], evdev: 26, vk: 0xDB },
-    Minus { names: ["minus"], evdev: 12, vk: 0xBD },
-    RightBrace { names: ["right_brace"], evdev: 27, vk: 0xDD },
-    Semicolon { names: ["semicolon"], evdev: 39, vk: 0xBA },
-    Slash { names: ["slash"], evdev: 53, vk: 0xBF },
+    // Punctuation (named by the literal unshifted glyph the key produces)
+    Apostrophe { names: ["'"], evdev: 40, vk: 0xDE },
+    Backslash { names: ["\\"], evdev: 43, vk: 0xDC },
+    Comma { names: [","], evdev: 51, vk: 0xBC },
+    Dot { names: ["."], evdev: 52, vk: 0xBE },
+    Equal { names: ["="], evdev: 13, vk: 0xBB },
+    Backtick { names: ["`"], evdev: 41, vk: 0xC0 },
+    LeftBrace { names: ["["], evdev: 26, vk: 0xDB },
+    Minus { names: ["-"], evdev: 12, vk: 0xBD },
+    RightBrace { names: ["]"], evdev: 27, vk: 0xDD },
+    Semicolon { names: [";"], evdev: 39, vk: 0xBA },
+    Slash { names: ["/"], evdev: 53, vk: 0xBF },
 
     // Function keys
     F1 { names: ["f1"], evdev: 59, vk: 0x70 },
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn parses_multi_modifier_combo() {
-        let combo = Combo::parse("C-M-s-S-a").unwrap();
+        let combo = Combo::parse("C+M+s+S+a").unwrap();
         assert_eq!(combo.key, Key::A);
         assert!(combo.modifiers.contains(&Modifier::Control));
         assert!(combo.modifiers.contains(&Modifier::Alt));
@@ -323,24 +323,35 @@ mod tests {
     }
 
     #[test]
-    fn emacs_single_letter_super_and_shift_are_case_sensitive() {
-        // S = Shift, s = Super (Emacs convention).
-        let shift = Combo::parse("C-S-a").unwrap();
+    fn single_letter_super_and_shift_are_case_sensitive() {
+        // S = Shift, s = Super (Emacs-style modifier letters).
+        let shift = Combo::parse("C+S+a").unwrap();
         assert!(shift.modifiers.contains(&Modifier::Control));
         assert!(shift.modifiers.contains(&Modifier::Shift));
         assert!(!shift.modifiers.contains(&Modifier::Super));
 
-        let super_ = Combo::parse("C-s-a").unwrap();
+        let super_ = Combo::parse("C+s+a").unwrap();
         assert!(super_.modifiers.contains(&Modifier::Super));
         assert!(!super_.modifiers.contains(&Modifier::Shift));
 
         // The 's' key is still a key when it is the final token.
-        assert_eq!(Combo::parse("C-s").unwrap().key, Key::S);
+        assert_eq!(Combo::parse("C+s").unwrap().key, Key::S);
+    }
+
+    #[test]
+    fn parses_literal_symbol_keys() {
+        // Punctuation keys are named by their glyph and need no escaping in the
+        // combo grammar now that `+` (not `-`) is the separator.
+        assert_eq!(Combo::parse("C+-").unwrap().key, Key::Minus);
+        assert_eq!(Combo::parse("C+S+=").unwrap().key, Key::Equal);
+        assert_eq!(Combo::parse("s+/").unwrap().key, Key::Slash);
+        assert_eq!(Combo::parse("[").unwrap().key, Key::LeftBrace);
+        assert_eq!(Combo::parse("-").unwrap().key, Key::Minus);
     }
 
     #[test]
     fn parses_hyper_and_digit() {
-        let combo = Combo::parse("Hyper-1").unwrap();
+        let combo = Combo::parse("Hyper+1").unwrap();
         assert_eq!(combo.key, Key::Num1);
         assert_eq!(
             combo.modifiers.iter().copied().collect::<Vec<_>>(),
@@ -350,27 +361,26 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tokens() {
-        assert!(Combo::parse("Nope-a").is_err());
-        assert!(Combo::parse("C-boguskey").is_err());
+        assert!(Combo::parse("Nope+a").is_err());
+        assert!(Combo::parse("C+boguskey").is_err());
         assert!(Combo::parse("").is_err());
     }
 
     #[test]
     fn error_messages_are_actionable() {
-        // A trailing separator (trying to bind the `-` key as `-`) explains the fix.
-        let empty = Combo::parse("S-s--").unwrap_err().to_string();
+        // A trailing separator leaves the key missing and explains the grammar.
+        let empty = Combo::parse("C+").unwrap_err().to_string();
         assert!(empty.contains("invalid key combo"), "{empty}");
-        assert!(empty.contains("minus"), "{empty}");
+        assert!(empty.contains("the key is missing"), "{empty}");
 
         // Unknown modifier lists the valid prefixes.
-        let modifier = Combo::parse("Ctrl-a").unwrap_err().to_string();
+        let modifier = Combo::parse("Ctrl+a").unwrap_err().to_string();
         assert!(modifier.contains("unknown modifier"), "{modifier}");
         assert!(modifier.contains("Super"), "{modifier}");
 
-        // Unknown key (a bare symbol) points at key names.
-        let key = Combo::parse("S-s-=").unwrap_err().to_string();
+        // An unrecognized symbol points at key names.
+        let key = Combo::parse("S+s+@").unwrap_err().to_string();
         assert!(key.contains("unknown key"), "{key}");
-        assert!(key.contains("equal"), "{key}");
     }
 
     #[test]

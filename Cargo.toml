@@ -1,6 +1,6 @@
 [package]
 name = "rightkeys"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "A cross-platform key remapper for Linux (X11) and Windows"

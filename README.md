@@ -148,10 +148,10 @@ block of one or more step nodes (there is no `to=`/`mark-to=` shorthand, one
 form only):
 
 ```kdl
-bind "M-c" { keys "C-c"; }                  // emit a combo
-bind "C-a" { keys "home" extend="selection"; }  // adds Shift while a selection is active
-bind "C-k" { keys "S-end"; keys "C-x"; selection "clear"; }  // multiple steps, run in order
-bind "C-q" { pass-through; }                // let the original key through
+bind "M+c" { keys "C+c"; }                  // emit a combo
+bind "C+a" { keys "home" extend="selection"; }  // adds Shift while a selection is active
+bind "C+k" { keys "S+end"; keys "C+x"; selection "clear"; }  // multiple steps, run in order
+bind "C+q" { pass-through; }                // let the original key through
 ```
 
 Step nodes (inside a `bind { ... }` block):
@@ -192,10 +192,10 @@ virtual-desktop COM API. **On Windows this requires Windows 11 ≥ 24H2** (build
 warning and do nothing.
 
 ```kdl
-bind "s-M-b" { exec "brave.exe"; }                   // launch or focus Brave
-bind "Hyper-y" { wm action="adjust" dx=-30; }        // nudge window left
-bind "Hyper-6" { wm action="preset" w=0.6 h=0.75; }  // centred 60% × 75%
-bind "M-f10" { wm action="maximize-toggle"; }
+bind "s+M+b" { exec "brave.exe"; }                   // launch or focus Brave
+bind "Hyper+y" { wm action="adjust" dx=-30; }        // nudge window left
+bind "Hyper+6" { wm action="preset" w=0.6 h=0.75; }  // centred 60% × 75%
+bind "M+f10" { wm action="maximize-toggle"; }
 ```
 
 `keys` and `exec` can each give **per-OS targets** so one binding
@@ -206,10 +206,10 @@ dropped, and the binding still applies as long as some step remains, so one
 bind can pair a Windows-only step with a Linux-only one.
 
 ```kdl
-bind "s-M-b" { exec windows="brave.exe" linux="brave-browser"; }  // per-OS launch
-bind "s-M-x" { exec linux="code-insiders"; }                      // Linux only
-bind "C-s-a" { keys windows="C-a" linux="C-q"; }                  // per-OS remap
-bind "s-x"   { keys windows="C-esc"; exec linux="rofi.sh"; }      // Win keystroke / Linux exec
+bind "s+M+b" { exec windows="brave.exe" linux="brave-browser"; }  // per-OS launch
+bind "s+M+x" { exec linux="code-insiders"; }                      // Linux only
+bind "C+s+a" { keys windows="C+a" linux="C+q"; }                  // per-OS remap
+bind "s+x"   { keys windows="C+esc"; exec linux="rofi.sh"; }      // Win keystroke / Linux exec
 ```
 
 > **Note:** `exec` launches at this process's integrity level. If RightKeys runs
@@ -217,7 +217,7 @@ bind "s-x"   { keys windows="C-esc"; exec linux="rofi.sh"; }      // Win keystro
 
 ### Combos and modifiers
 
-A combo is `Mod-Mod-...-key`, e.g. `C-M-s-S-a` (Ctrl+Alt+Super+Shift+A).
+A combo is `Mod+Mod+...+key`, e.g. `C+M+s+S+a` (Ctrl+Alt+Super+Shift+A).
 Modifier prefixes are the Emacs-style letters and are **case-sensitive** (note
 `S` = Shift vs `s` = Super):
 
@@ -231,14 +231,16 @@ Modifier prefixes are the Emacs-style letters and are **case-sensitive** (note
 
 ### Key names
 
-Key names are descriptive and platform-neutral (mostly matching Linux evdev
-names). Each key has exactly one name.
+Letters, digits, and punctuation keys are named by the literal glyph they
+produce unshifted; the rest use descriptive, platform-neutral names. Each key
+has exactly one name. Because `+` (not `-`) separates a combo, symbol keys need
+no escaping, e.g. `C+-`, `C+S+=`, `s+/`.
 
 - **Letters:** `a` `b` `c` `d` `e` `f` `g` `h` `i` `j` `k` `l` `m` `n` `o` `p` `q` `r` `s` `t` `u` `v` `w` `x` `y` `z`
 - **Digits:** `0`-`9`
 - **Editing:** `backspace` `delete` `enter` `esc` `space` `tab`
 - **Navigation:** `up` `down` `left` `right` `home` `end` `page_up` `page_down`
-- **Punctuation:** `minus` `equal` `left_brace` `right_brace` `backslash` `semicolon` `apostrophe` `comma` `dot` `slash` `backtick`
+- **Punctuation:** `-` `=` `[` `]` `\` `;` `'` `,` `.` `/` `` ` `` (in KDL, write the backslash key as `"\\"`)
 - **Function:** `f1`-`f12`
 - **Media / system:** `volumeup` `volumedown` `mute` `playpause` `nextsong` `previoussong` `capslock` `pause` `scrolllock` `printscreen`
 - **Modifier keys:** `left_ctrl` `right_ctrl` `left_shift` `right_shift` `left_alt` `right_alt` `left_meta` `right_meta` `left_hyper` `right_hyper`
