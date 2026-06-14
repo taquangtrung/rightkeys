@@ -1,5 +1,11 @@
 //! rightkeys: a cross-platform, KDL-configured key remapper.
 
+// On Windows, build as a GUI-subsystem binary so launching it (tray icon,
+// autostart, Start menu) shows no console window; it just runs in the
+// background. A parent console is reattached at startup when one exists, so
+// CLI use (`--help`, `--debug`) still prints normally from a terminal.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 // Modules
 
 mod backend;
@@ -58,11 +64,26 @@ struct Cli {
 // Functions
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console();
     if let Err(error) = run() {
         report_error(&error);
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Reattach to the launching process's console, if any, so `stdout`/`stderr`
+/// reach the terminal for CLI use. The `windows` subsystem otherwise gives the
+/// process no console; this is a best-effort no-op when launched without one
+/// (tray, autostart), leaving such failures to the desktop notification path.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: a plain FFI call; the error (no parent console) is ignored.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 /// Report a fatal error: print it to stderr (bold red on a terminal, plain when
