@@ -362,8 +362,11 @@ impl X11Watcher {
         ))
     }
 
-    /// A window's absolute position and size (`x, y, w, h`).
-    fn window_geometry(&self, win: Window) -> Result<(i32, i32, i32, i32)> {
+    /// A window's client geometry (`x, y, w, h`): the inner rectangle the X
+    /// server reports, before the window manager's title bar and borders are
+    /// added. Use [`Self::frame_geometry`] wherever the visible outer rectangle
+    /// matters (snapping, animating, repeating against the work area).
+    fn client_geometry(&self, win: Window) -> Result<(i32, i32, i32, i32)> {
         let geo = self.conn.get_geometry(win)?.reply()?;
         let abs = self
             .conn
@@ -377,34 +380,69 @@ impl X11Watcher {
         ))
     }
 
-    /// A window's geometry, preferring the value we last commanded while it is
-    /// still fresh. The window manager applies moves asynchronously, so a server
-    /// read taken between rapid nudges lags behind; accumulating on our own
-    /// target keeps held-key movement smooth and free of frame-extent creep.
+    /// A window's outer (frame) geometry (`x, y, w, h`): client geometry grown
+    /// by the window manager's `_NET_FRAME_EXTENTS`. WMs that do not set that
+    /// property — and undecorated windows — read back all-zero extents, so the
+    /// frame equals the client and the same code path handles both cases.
+    fn frame_geometry(&self, win: Window) -> Result<(i32, i32, i32, i32)> {
+        let client = self.client_geometry(win)?;
+        let extents = self.frame_extents(win)?;
+        Ok(frame_geom(client, extents))
+    }
+
+    /// The window manager's frame extents for `win` as
+    /// `(left, right, top, bottom)`, or `(0, 0, 0, 0)` when the property is
+    /// missing — the case for undecorated windows and WMs that do not implement
+    /// `_NET_FRAME_EXTENTS`.
+    fn frame_extents(&self, win: Window) -> Result<(i32, i32, i32, i32)> {
+        let atom = self.atom(b"_NET_FRAME_EXTENTS")?;
+        let reply = self
+            .conn
+            .get_property(false, win, atom, AtomEnum::CARDINAL, 0, 4)?
+            .reply()?;
+        let vals: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
+        Ok(match vals.as_slice() {
+            [left, right, top, bottom] => {
+                (*left as i32, *right as i32, *top as i32, *bottom as i32)
+            }
+            _ => (0, 0, 0, 0),
+        })
+    }
+
+    /// A window's outer (frame) geometry, preferring the value we last
+    /// commanded while it is still fresh. The window manager applies moves
+    /// asynchronously, so a server read taken between rapid nudges lags behind;
+    /// accumulating on our own target keeps held-key movement smooth.
     fn current_geometry(&mut self, win: Window) -> Result<(i32, i32, i32, i32)> {
         if let Some(cache) = &self.last_move {
             if cache.win == win && cache.at.elapsed() < MOVE_CACHE_TTL {
                 return Ok(cache.geom);
             }
         }
-        self.window_geometry(win)
+        self.frame_geometry(win)
     }
 
-    /// Move/resize a window to an absolute geometry. A large jump (snap, preset,
-    /// center, ...) glides there along an ease-out curve; a small one (a held
-    /// move/resize nudge) lands instantly so rapid repeats stay responsive.
+    /// Move/resize a window so its outer (frame) rectangle lands at
+    /// `(x, y, w, h)`. A large jump (snap, preset, center, ...) glides there
+    /// along an ease-out curve; a small one (a held move/resize nudge) lands
+    /// instantly so rapid repeats stay responsive.
+    ///
+    /// The target is in frame geometry so it lines up with the work area and
+    /// with [`Self::current_geometry`]; `_NET_MOVERESIZE_WINDOW` is then fed the
+    /// frame position alongside the client size it expects.
     fn move_resize(&mut self, win: Window, x: i32, y: i32, w: i32, h: i32) -> Result<()> {
         let target = (x, y, w.max(1), h.max(1));
         let start = self.current_geometry(win)?;
+        let extents = self.frame_extents(win)?;
         // Intern the atom once and reuse it across every frame of the animation.
         let atom = self.atom(b"_NET_MOVERESIZE_WINDOW")?;
         if max_delta(start, target) >= ANIM_MIN_DELTA {
             for frame in anim_frames(start, target, ANIM_STEPS) {
-                self.send_move_resize(win, atom, frame)?;
+                self.send_move_resize(win, atom, frame, extents)?;
                 thread::sleep(ANIM_FRAME_PAUSE);
             }
         } else {
-            self.send_move_resize(win, atom, target)?;
+            self.send_move_resize(win, atom, target, extents)?;
         }
         self.last_move = Some(MoveCache {
             at: Instant::now(),
@@ -415,9 +453,17 @@ impl X11Watcher {
     }
 
     /// Send a single `_NET_MOVERESIZE_WINDOW` request for an already-interned
-    /// atom; no animation, no cache update.
-    fn send_move_resize(&self, win: Window, atom: u32, geom: (i32, i32, i32, i32)) -> Result<()> {
-        let (x, y, w, h) = geom;
+    /// atom; no animation, no cache update. `geom` is a target frame rectangle,
+    /// translated to the message's frame-position + client-size layout via
+    /// `extents`.
+    fn send_move_resize(
+        &self,
+        win: Window,
+        atom: u32,
+        geom: (i32, i32, i32, i32),
+        extents: (i32, i32, i32, i32),
+    ) -> Result<()> {
+        let (x, y, w, h) = moveresize_message(geom, extents);
         // Gravity NorthWest (1) + flags for x/y/w/h present + source = pager.
         let flags = 1u32 | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 13);
         self.send_root_message(
@@ -577,6 +623,26 @@ fn anchor_pos(
         Some(Corner::BottomLeft) => (ax, ay + ah - nh),
         Some(Corner::BottomRight) => (ax + aw - nw, ay + ah - nh),
     }
+}
+
+/// Grow a client window's geometry outward by `_NET_FRAME_EXTENTS`
+/// `(left, right, top, bottom)` to obtain the outer frame rectangle the window
+/// manager draws around it. The size-wise inverse of [`moveresize_message`].
+fn frame_geom(
+    (x, y, w, h): (i32, i32, i32, i32),
+    (left, right, top, bottom): (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    (x - left, y - top, w + left + right, h + top + bottom)
+}
+
+/// Translate a target frame rectangle into the `(x, y, w, h)` payload for
+/// `_NET_MOVERESIZE_WINDOW`, which expects the frame position (kept as-is) but
+/// the client size (extents stripped from width and height).
+fn moveresize_message(
+    (x, y, w, h): (i32, i32, i32, i32),
+    (left, right, top, bottom): (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    (x, y, w - left - right, h - top - bottom)
 }
 
 /// The largest absolute change across the four geometry dimensions of `a` → `b`.
@@ -981,6 +1047,26 @@ mod tests {
     fn max_delta_picks_largest_dimension() {
         assert_eq!(max_delta((0, 0, 100, 100), (5, -30, 140, 100)), 40);
         assert_eq!(max_delta((10, 10, 10, 10), (10, 10, 10, 10)), 0);
+    }
+
+    #[test]
+    fn frame_geom_grows_client_outward_by_extents() {
+        // Client at (10, 20) of size 300×200; a 3/5/30/4 frame (typical
+        // title-bar-heavy Linux WM) yields an outer rectangle shifted up-left
+        // and grown by the sum of opposing sides.
+        let client = (10, 20, 300, 200);
+        let extents = (3, 5, 30, 4);
+        assert_eq!(frame_geom(client, extents), (7, -10, 308, 234));
+    }
+
+    #[test]
+    fn moveresize_message_keeps_position_strips_extents_from_size() {
+        // Inverse of `frame_geom` on size: the frame rectangle lands where the
+        // caller asked, and `_NET_MOVERESIZE_WINDOW` is told the smaller client
+        // size so the WM-painted frame reaches the target edges.
+        let frame = (7, -10, 308, 234);
+        let extents = (3, 5, 30, 4);
+        assert_eq!(moveresize_message(frame, extents), (7, -10, 300, 200));
     }
 
     #[test]
