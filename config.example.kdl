@@ -76,6 +76,9 @@ keymap name="Hyper layer" {
     bind "Hyper+t" { wm action="always-on-top"; }           // toggle keep-above
     bind "Hyper+n" { wm action="move-to-monitor" to="next"; }
     bind "Hyper+`" { wm action="cycle-same-app" direction="forward"; }
+    // Vimium-style window picker: shows a hint label on every window; type the
+    // hint to focus it. Backspace edits the prefix; Escape cancels. Linux only.
+    bind "Hyper+/" { wm action="find-window"; }
 }
 
 // App launchers — one binding per combo, with per-OS program targets. A combo

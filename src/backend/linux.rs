@@ -3,22 +3,28 @@
 
 // Imports
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use anyhow::{anyhow, Context, Result};
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, Window,
+    AtomEnum, ClientMessageEvent, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
+    ImageFormat, ImageOrder, Pixmap, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
+use super::actions::findwindow::{
+    advance, key_to_hint_char, make_hints, place_hint, split_app_from_title, HintMatch,
+};
 use super::{Options, WindowWatcher};
 use crate::engine::{
     Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace,
@@ -62,6 +68,47 @@ const ANIM_STEPS: u32 = 16;
 /// transition duration (~128 ms).
 const ANIM_FRAME_PAUSE: Duration = Duration::from_millis(8);
 
+/// Pixel size the find-window overlay renders the hint key at. Larger than a
+/// core X bitmap font so the hints read clearly from across the screen.
+const OVERLAY_FONT_PX: f32 = 32.0;
+
+/// Pixel size for the app-name line (the brand stripped from the title).
+const OVERLAY_APP_FONT_PX: f32 = 22.0;
+
+/// Pixel size for the smaller window-title line beneath the app name.
+const OVERLAY_INFO_FONT_PX: f32 = 18.0;
+
+/// Vertical gap between the app-name and window-title lines (pixels).
+const INFO_LINE_GAP: i32 = 2;
+
+/// Maximum width of the app/title info text before it is truncated (pixels).
+const MAX_INFO_WIDTH_PX: i32 = 560;
+
+/// Vertical padding above and below the text inside an overlay chip (pixels).
+const OVERLAY_VPAD: i32 = 5;
+
+/// Horizontal padding inside the hint key chip (pixels on each side).
+const HINT_CHIP_PAD: i32 = 9;
+/// Horizontal padding inside the app-name chip (pixels on each side).
+const APP_CHIP_PAD: i32 = 11;
+
+/// Overlay chip colors as `(r, g, b)`: a navy hint chip with a sky-blue border
+/// and text, beside a steel-blue app chip with light-slate text.
+const HINT_BG: (u8, u8, u8) = (0x17, 0x25, 0x54);
+const HINT_FG: (u8, u8, u8) = (0x38, 0xbd, 0xf8);
+const HINT_BORDER: (u8, u8, u8) = (0x60, 0xa5, 0xfa);
+const APP_BG: (u8, u8, u8) = (0x23, 0x48, 0x7a);
+const APP_FG: (u8, u8, u8) = (0xe8, 0xee, 0xf6);
+/// Window-title text: a light slate that reads as a subtitle under the app name.
+const TITLE_FG: (u8, u8, u8) = (0xc4, 0xcf, 0xde);
+
+/// Fonts tried, in order, when `fc-match` cannot resolve the system sans font.
+const FALLBACK_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+];
+
 // Data Structures
 
 /// A key event read from a grabbed device.
@@ -78,11 +125,337 @@ struct MoveCache {
     win: Window,
 }
 
+/// One entry in the find-window hint overlay: a target window with the
+/// override-redirect window and the pixmap holding its pre-rendered chip image.
+/// Its hint label lives at the same index in [`FindWindowOverlay::hints`].
+struct HintEntry {
+    overlay: Window,
+    pixmap: Pixmap,
+    target: Window,
+}
+
+/// Active state of the Vimium-style window-finder overlay.
+struct FindWindowOverlay {
+    entries: Vec<HintEntry>,
+    hints: Vec<String>,
+    prefix: String,
+}
+
+/// A CPU-rendered RGB image, row-major, used to compose an overlay chip before
+/// uploading it to the X server.
+struct TextImage {
+    width: u16,
+    height: u16,
+    pixels: Vec<(u8, u8, u8)>,
+}
+
+/// The server's Z-pixmap layout for the root depth, so a [`TextImage`] can be
+/// serialized into the byte order and channel positions `put_image` expects.
+struct ImageFmt {
+    bytes_per_pixel: usize,
+    scanline_pad_bytes: usize,
+    lsb_first: bool,
+    r_shift: u32,
+    g_shift: u32,
+    b_shift: u32,
+}
+
+/// Rasterizes overlay labels with the system font: the hint key at
+/// [`OVERLAY_FONT_PX`], the app-name line at [`OVERLAY_APP_FONT_PX`], and the
+/// window-title line at [`OVERLAY_INFO_FONT_PX`].
+///
+/// `fonts[0]` is the primary sans font; later entries are fallbacks loaded on
+/// demand (via fontconfig) to cover characters the primary lacks — CJK, Arabic,
+/// and other scripts — so non-Latin titles render instead of showing blanks.
+struct OverlayRenderer {
+    fonts: Vec<FontVec>,
+    /// Loaded fallback font file paths → index into `fonts`, to avoid reloading.
+    loaded: HashMap<String, usize>,
+    /// Resolved character → `fonts` index, memoized across a render pass.
+    cache: HashMap<char, usize>,
+    hint_scale: PxScale,
+    app_scale: PxScale,
+    info_scale: PxScale,
+}
+
+// === FindWindowOverlay ===
+
+impl FindWindowOverlay {
+    /// Feed a hint character; returns the chosen target window once a single
+    /// hint remains.
+    fn input(&mut self, ch: char) -> Option<Window> {
+        match advance(&self.hints, &mut self.prefix, ch) {
+            HintMatch::Done(i) => Some(self.entries[i].target),
+            HintMatch::Pending => None,
+        }
+    }
+
+    fn backspace(&mut self) {
+        self.prefix.pop();
+    }
+}
+
+// === TextImage ===
+
+impl TextImage {
+    /// A `width`×`height` image filled with `bg`.
+    fn new(width: u16, height: u16, bg: (u8, u8, u8)) -> Self {
+        TextImage {
+            width,
+            height,
+            pixels: vec![bg; width as usize * height as usize],
+        }
+    }
+
+    /// Set one pixel, ignoring out-of-bounds coordinates.
+    fn set(&mut self, x: i32, y: i32, color: (u8, u8, u8)) {
+        if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
+            self.pixels[y as usize * self.width as usize + x as usize] = color;
+        }
+    }
+
+    /// Fill a rectangle, clipped to the image bounds.
+    fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: (u8, u8, u8)) {
+        for py in y..y + h {
+            for px in x..x + w {
+                self.set(px, py, color);
+            }
+        }
+    }
+
+    /// Draw a 1-pixel rectangle outline, clipped to the image bounds.
+    fn draw_outline(&mut self, x: i32, y: i32, w: i32, h: i32, color: (u8, u8, u8)) {
+        for px in x..x + w {
+            self.set(px, y, color);
+            self.set(px, y + h - 1, color);
+        }
+        for py in y..y + h {
+            self.set(x, py, color);
+            self.set(x + w - 1, py, color);
+        }
+    }
+
+    /// Alpha-blend `color` over the pixel at `(x, y)` with coverage `cov` ∈ [0, 1].
+    fn blend(&mut self, x: i32, y: i32, color: (u8, u8, u8), cov: f32) {
+        if cov <= 0.0 || x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let idx = y as usize * self.width as usize + x as usize;
+        let (br, bg, bb) = self.pixels[idx];
+        let mix = |base: u8, fg: u8| {
+            (base as f32 * (1.0 - cov) + fg as f32 * cov).round().clamp(0.0, 255.0) as u8
+        };
+        self.pixels[idx] = (mix(br, color.0), mix(bg, color.1), mix(bb, color.2));
+    }
+}
+
+// === OverlayRenderer ===
+
+impl OverlayRenderer {
+    /// Load the system sans font as the primary; fallbacks load on demand.
+    fn load() -> Result<Self> {
+        let bytes = system_font_bytes()?;
+        let font = FontVec::try_from_vec(bytes)
+            .map_err(|err| anyhow!("parsing the overlay font: {err}"))?;
+        Ok(OverlayRenderer {
+            fonts: vec![font],
+            loaded: HashMap::new(),
+            cache: HashMap::new(),
+            hint_scale: PxScale::from(OVERLAY_FONT_PX),
+            app_scale: PxScale::from(OVERLAY_APP_FONT_PX),
+            info_scale: PxScale::from(OVERLAY_INFO_FONT_PX),
+        })
+    }
+
+    /// Index into `fonts` of a font that can render `c`: the primary if it has
+    /// the glyph, else an already-loaded fallback, else one resolved through
+    /// fontconfig and loaded now. Falls back to the primary (index 0, a blank
+    /// `.notdef`) when nothing covers `c`. Results are memoized.
+    fn resolve_font(&mut self, c: char) -> usize {
+        if let Some(&idx) = self.cache.get(&c) {
+            return idx;
+        }
+        let idx = self.resolve_uncached(c);
+        self.cache.insert(c, idx);
+        idx
+    }
+
+    fn resolve_uncached(&mut self, c: char) -> usize {
+        if c.is_whitespace() || self.fonts[0].glyph_id(c).0 != 0 {
+            return 0;
+        }
+        for i in 1..self.fonts.len() {
+            if self.fonts[i].glyph_id(c).0 != 0 {
+                return i;
+            }
+        }
+        let Some(path) = fc_match_char(c) else {
+            return 0;
+        };
+        if let Some(&i) = self.loaded.get(&path) {
+            return i;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(font) = FontVec::try_from_vec(bytes) {
+                if font.glyph_id(c).0 != 0 {
+                    self.fonts.push(font);
+                    let i = self.fonts.len() - 1;
+                    self.loaded.insert(path, i);
+                    return i;
+                }
+            }
+        }
+        0
+    }
+
+    /// Pixel width that `text` will occupy at `scale` (sum of glyph advances,
+    /// each from the font that covers the character).
+    fn text_width(&mut self, text: &str, scale: PxScale) -> i32 {
+        let mut width = 0.0;
+        for c in text.chars() {
+            let idx = self.resolve_font(c);
+            let font = &self.fonts[idx];
+            width += font.as_scaled(scale).h_advance(font.glyph_id(c));
+        }
+        width.ceil() as i32
+    }
+
+    /// Full line height (ascent plus descent) at `scale`, from the primary font
+    /// so all lines share a baseline rhythm regardless of fallbacks.
+    fn line_height(&self, scale: PxScale) -> i32 {
+        let scaled = self.fonts[0].as_scaled(scale);
+        (scaled.ascent() - scaled.descent()).ceil() as i32
+    }
+
+    /// Ascent of the primary font at `scale`, used to place baselines.
+    fn ascent(&self, scale: PxScale) -> f32 {
+        self.fonts[0].as_scaled(scale).ascent()
+    }
+
+    /// `text` shortened with a trailing ellipsis so it fits within `max_px` at
+    /// `scale`; returned unchanged when it already fits.
+    fn truncate(&mut self, text: &str, scale: PxScale, max_px: i32) -> String {
+        if text.is_empty() || self.text_width(text, scale) <= max_px {
+            return text.to_string();
+        }
+        let ellipsis = '…';
+        let ellipsis_w = {
+            let idx = self.resolve_font(ellipsis);
+            let font = &self.fonts[idx];
+            font.as_scaled(scale).h_advance(font.glyph_id(ellipsis))
+        };
+        let mut out = String::new();
+        let mut width = 0.0;
+        for c in text.chars() {
+            let idx = self.resolve_font(c);
+            let font = &self.fonts[idx];
+            let advance = font.as_scaled(scale).h_advance(font.glyph_id(c));
+            if width + advance + ellipsis_w > max_px as f32 {
+                break;
+            }
+            out.push(c);
+            width += advance;
+        }
+        out.push(ellipsis);
+        out
+    }
+
+    /// Draw `text` left-aligned at `x0`, on `baseline`, at `scale`, in `color`,
+    /// rasterizing each character from the font that covers it.
+    fn draw_text(
+        &mut self,
+        img: &mut TextImage,
+        text: &str,
+        x0: i32,
+        baseline: f32,
+        scale: PxScale,
+        color: (u8, u8, u8),
+    ) {
+        let mut pen = x0 as f32;
+        for c in text.chars() {
+            let idx = self.resolve_font(c);
+            let font = &self.fonts[idx];
+            let id = font.glyph_id(c);
+            let glyph = id.with_scale_and_position(scale, point(pen, baseline));
+            if let Some(outline) = font.outline_glyph(glyph) {
+                let bounds = outline.px_bounds();
+                outline.draw(|gx, gy, cov| {
+                    img.blend(
+                        bounds.min.x as i32 + gx as i32,
+                        bounds.min.y as i32 + gy as i32,
+                        color,
+                        cov,
+                    );
+                });
+            }
+            pen += font.as_scaled(scale).h_advance(id);
+        }
+    }
+
+    /// Compose one hint's label: a bordered hint-key chip on the left, and an
+    /// info chip on the right carrying the app name (larger) above the window
+    /// title (smaller). The info chip is omitted when both are empty; a missing
+    /// app or title collapses to the single remaining line.
+    fn render_label(&mut self, hint: &str, app: &str, title: &str) -> TextImage {
+        let app = self.truncate(app, self.app_scale, MAX_INFO_WIDTH_PX);
+        let title = self.truncate(title, self.info_scale, MAX_INFO_WIDTH_PX);
+        let has_app = !app.is_empty();
+        let has_title = !title.is_empty();
+        let has_info = has_app || has_title;
+
+        let hint_line = self.line_height(self.hint_scale);
+        let app_line = self.line_height(self.app_scale);
+        let title_line = self.line_height(self.info_scale);
+        let info_block = match (has_app, has_title) {
+            (true, true) => app_line + INFO_LINE_GAP + title_line,
+            (true, false) => app_line,
+            (false, true) => title_line,
+            (false, false) => 0,
+        };
+        let height = hint_line.max(info_block) + OVERLAY_VPAD * 2;
+
+        let hint_w = self.text_width(hint, self.hint_scale) + HINT_CHIP_PAD * 2;
+        let info_w = if has_info {
+            self.text_width(&app, self.app_scale)
+                .max(self.text_width(&title, self.info_scale))
+                + APP_CHIP_PAD * 2
+        } else {
+            0
+        };
+
+        let mut img = TextImage::new((hint_w + info_w) as u16, height as u16, HINT_BG);
+        if info_w > 0 {
+            img.fill_rect(hint_w, 0, info_w, height, APP_BG);
+        }
+        img.draw_outline(0, 0, hint_w, height, HINT_BORDER);
+
+        // Center the hint key vertically against the (possibly taller) info block.
+        let hint_baseline = (height - hint_line) as f32 / 2.0 + self.ascent(self.hint_scale);
+        self.draw_text(&mut img, hint, HINT_CHIP_PAD, hint_baseline, self.hint_scale, HINT_FG);
+
+        if has_info {
+            let x = hint_w + APP_CHIP_PAD;
+            let mut top = (height - info_block) as f32 / 2.0;
+            if has_app {
+                let baseline = top + self.ascent(self.app_scale);
+                self.draw_text(&mut img, &app, x, baseline, self.app_scale, APP_FG);
+                top += (app_line + INFO_LINE_GAP) as f32;
+            }
+            if has_title {
+                let baseline = top + self.ascent(self.info_scale);
+                self.draw_text(&mut img, &title, x, baseline, self.info_scale, TITLE_FG);
+            }
+        }
+        img
+    }
+}
+
 /// X11-based active-window watcher with a one-entry focus cache. Also performs
 /// window-management [`Effect`]s via EWMH messages to the root window.
 struct X11Watcher {
     conn: RustConnection,
     root: Window,
+    screen_num: usize,
     cached_focus: Window,
     cached_class: String,
     last_move: Option<MoveCache>,
@@ -95,11 +468,12 @@ struct X11Watcher {
 
 impl X11Watcher {
     fn connect() -> Result<Self> {
-        let (conn, screen) = x11rb::connect(None).context("connecting to X11 display")?;
-        let root = conn.setup().roots[screen].root;
+        let (conn, screen_num) = x11rb::connect(None).context("connecting to X11 display")?;
+        let root = conn.setup().roots[screen_num].root;
         Ok(X11Watcher {
             conn,
             root,
+            screen_num,
             cached_focus: 0,
             cached_class: String::new(),
             last_move: None,
@@ -265,6 +639,7 @@ impl X11Watcher {
             WindowAction::AlwaysOnTop => self.toggle_above(win)?,
             WindowAction::MoveToMonitor(direction) => self.move_to_monitor(win, direction)?,
             WindowAction::CycleSameApp(direction) => self.cycle_same_app(win, direction)?,
+            WindowAction::FindWindow => {} // intercepted in run() before perform_effect
             WindowAction::Workspace { .. } | WindowAction::ShowDesktop => {
                 unreachable!("handled above")
             }
@@ -552,6 +927,263 @@ impl X11Watcher {
         self.send_root_message(win, atom, [2, CURRENT_TIME, 0, 0, 0])
     }
 
+    // ── find-window overlay ──
+
+    /// Build and display the Vimium-style hint overlay over every window on the
+    /// current desktop; returns the overlay state for key-event routing.
+    fn start_find_window(&mut self) -> Result<FindWindowOverlay> {
+        // Pipeline all atoms before waiting for any reply.
+        let desktop_atom_c = self.conn.intern_atom(false, b"_NET_CURRENT_DESKTOP")?;
+        let client_list_atom_c = self.conn.intern_atom(false, b"_NET_CLIENT_LIST")?;
+        let wm_desktop_atom_c = self.conn.intern_atom(false, b"_NET_WM_DESKTOP")?;
+        let frame_ext_atom_c = self.conn.intern_atom(false, b"_NET_FRAME_EXTENTS")?;
+        let net_name_atom_c = self.conn.intern_atom(false, b"_NET_WM_NAME")?;
+        let utf8_atom_c = self.conn.intern_atom(false, b"UTF8_STRING")?;
+        let desktop_atom = desktop_atom_c.reply()?.atom;
+        let client_list_atom = client_list_atom_c.reply()?.atom;
+        let wm_desktop_atom = wm_desktop_atom_c.reply()?.atom;
+        let frame_ext_atom = frame_ext_atom_c.reply()?.atom;
+        let net_name_atom = net_name_atom_c.reply()?.atom;
+        let utf8_atom = utf8_atom_c.reply()?.atom;
+
+        let cur_desk_c =
+            self.conn.get_property(false, self.root, desktop_atom, AtomEnum::CARDINAL, 0, 1)?;
+        let client_list_c =
+            self.conn.get_property(false, self.root, client_list_atom, AtomEnum::WINDOW, 0, 4096)?;
+        let desktop = cur_desk_c
+            .reply()?
+            .value32()
+            .and_then(|mut it| it.next())
+            .ok_or_else(|| anyhow!("_NET_CURRENT_DESKTOP unavailable"))?;
+        let wins: Vec<Window> =
+            client_list_c.reply()?.value32().map(|it| it.collect()).unwrap_or_default();
+
+        if wins.is_empty() {
+            anyhow::bail!("no windows on the current desktop");
+        }
+
+        // Pipeline 6×N per-window reads; the first .reply() flushes and waits,
+        // subsequent ones drain from the already-buffered replies.
+        let desk_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| {
+                self.conn.get_property(false, w, wm_desktop_atom, AtomEnum::CARDINAL, 0, 1)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        let coord_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| self.conn.translate_coordinates(w, self.root, 0, 0))
+            .collect::<std::result::Result<_, _>>()?;
+        let fext_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| {
+                self.conn.get_property(false, w, frame_ext_atom, AtomEnum::CARDINAL, 0, 4)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        let class_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| {
+                self.conn.get_property(false, w, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        // Title: prefer the UTF-8 `_NET_WM_NAME`, fall back to legacy `WM_NAME`.
+        let name_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| self.conn.get_property(false, w, net_name_atom, utf8_atom, 0, 256))
+            .collect::<std::result::Result<_, _>>()?;
+        let wmname_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| {
+                self.conn.get_property(false, w, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
+        let windows: Vec<(Window, (i32, i32), String, String)> = desk_cs
+            .into_iter()
+            .zip(coord_cs)
+            .zip(fext_cs)
+            .zip(class_cs)
+            .zip(name_cs)
+            .zip(wmname_cs)
+            .zip(wins)
+            .filter_map(|((((((d, c), f), k), n), wn), win)| {
+                let win_desktop = d.reply().ok()?.value32()?.next()?;
+                if win_desktop != desktop {
+                    return None;
+                }
+                let coords = c.reply().ok()?;
+                let (left, top) = f
+                    .reply()
+                    .ok()
+                    .and_then(|r| {
+                        let mut it = r.value32()?;
+                        let left = it.next()? as i32;
+                        let _right = it.next()?;
+                        let top = it.next()? as i32;
+                        Some((left, top))
+                    })
+                    .unwrap_or((0, 0));
+                let x = coords.dst_x as i32 - left;
+                let y = coords.dst_y as i32 - top;
+                let app =
+                    k.reply().ok().map(|r| parse_wm_class(&r.value)).unwrap_or_default();
+                let title = n
+                    .reply()
+                    .ok()
+                    .map(|r| parse_window_name(&r.value))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| wn.reply().ok().map(|r| parse_window_name(&r.value)))
+                    .unwrap_or_default();
+                // Line 1 shows the app's brand as it appears in the title (e.g.
+                // "Visual Studio Code - Insiders"), falling back to the WM_CLASS
+                // name when the title carries no recognizable brand; line 2 is
+                // the remaining document/page part.
+                let (brand, rest) = split_app_from_title(&title, &app);
+                let label = if brand.is_empty() { app } else { brand };
+                Some((win, (x, y), label, rest))
+            })
+            .collect();
+
+        if windows.is_empty() {
+            anyhow::bail!("no windows on the current desktop");
+        }
+
+        let hints = make_hints(windows.len());
+        let mut renderer =
+            OverlayRenderer::load().context("loading the find-window overlay font")?;
+        let fmt = self.image_fmt()?;
+        // One scratch GC drives every `put_image`; freed once the chips are up.
+        let upload_gc: Gcontext = self.conn.generate_id()?;
+        self.conn.create_gc(upload_gc, self.root, &CreateGCAux::new())?;
+
+        let screen = &self.conn.setup().roots[self.screen_num];
+        let screen_w = screen.width_in_pixels;
+        let screen_h = screen.height_in_pixels;
+        let depth = screen.root_depth;
+
+        let screen = (screen_w as i32, screen_h as i32);
+        let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut entries = Vec::new();
+        for ((win, (x, y), app, title), hint) in windows.iter().zip(hints.iter()) {
+            let img = renderer.render_label(&hint.to_uppercase(), app, title);
+            let pixmap = self.upload_image(&fmt, upload_gc, depth, &img)?;
+            let size = (img.width as i32, img.height as i32);
+            let (px, py) = place_hint((*x, *y), size, &placed, screen);
+            placed.push((px, py, size.0, size.1));
+
+            let overlay: Window = self.conn.generate_id()?;
+            self.conn.create_window(
+                0u8,
+                overlay,
+                self.root,
+                px as i16,
+                py as i16,
+                img.width,
+                img.height,
+                0u16,
+                WindowClass::INPUT_OUTPUT,
+                0u32,
+                &CreateWindowAux::new()
+                    .background_pixmap(pixmap)
+                    .override_redirect(1u32),
+            )?;
+            self.conn.map_window(overlay)?;
+
+            entries.push(HintEntry {
+                overlay,
+                pixmap,
+                target: *win,
+            });
+        }
+        self.conn.free_gc(upload_gc)?;
+        self.conn.flush()?;
+
+        Ok(FindWindowOverlay {
+            entries,
+            hints,
+            prefix: String::new(),
+        })
+    }
+
+    /// The server's Z-pixmap layout for the root depth, used to serialize a
+    /// [`TextImage`] for `put_image`.
+    fn image_fmt(&self) -> Result<ImageFmt> {
+        let setup = self.conn.setup();
+        let screen = &setup.roots[self.screen_num];
+        let depth = screen.root_depth;
+        let format = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == depth)
+            .ok_or_else(|| anyhow!("no pixmap format for depth {depth}"))?;
+        let visual = screen
+            .allowed_depths
+            .iter()
+            .flat_map(|d| &d.visuals)
+            .find(|v| v.visual_id == screen.root_visual)
+            .ok_or_else(|| anyhow!("root visual {} not found", screen.root_visual))?;
+        Ok(ImageFmt {
+            bytes_per_pixel: format.bits_per_pixel as usize / 8,
+            scanline_pad_bytes: format.scanline_pad as usize / 8,
+            lsb_first: setup.image_byte_order == ImageOrder::LSB_FIRST,
+            r_shift: visual.red_mask.trailing_zeros(),
+            g_shift: visual.green_mask.trailing_zeros(),
+            b_shift: visual.blue_mask.trailing_zeros(),
+        })
+    }
+
+    /// Create a pixmap holding `img`, serialized to the server's pixel layout.
+    fn upload_image(
+        &self,
+        fmt: &ImageFmt,
+        gc: Gcontext,
+        depth: u8,
+        img: &TextImage,
+    ) -> Result<Pixmap> {
+        let pixmap: Pixmap = self.conn.generate_id()?;
+        self.conn
+            .create_pixmap(depth, pixmap, self.root, img.width, img.height)?;
+        let data = encode_image(fmt, img);
+        self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            pixmap,
+            gc,
+            img.width,
+            img.height,
+            0,
+            0,
+            0,
+            depth,
+            &data,
+        )?;
+        Ok(pixmap)
+    }
+
+    /// Show overlays whose hint still matches `fw.prefix`; hide the rest. The
+    /// chip image is the window's background pixmap, so a freshly mapped overlay
+    /// only needs a `clear_area` to repaint it.
+    fn update_find_window_visibility(&self, fw: &FindWindowOverlay) -> Result<()> {
+        for (entry, hint) in fw.entries.iter().zip(fw.hints.iter()) {
+            if hint.starts_with(&fw.prefix) {
+                self.conn.map_window(entry.overlay)?;
+                self.conn.clear_area(false, entry.overlay, 0, 0, 0, 0)?;
+            } else {
+                self.conn.unmap_window(entry.overlay)?;
+            }
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Destroy all overlay windows and free their pixmaps.
+    fn destroy_find_window(&self, fw: FindWindowOverlay) {
+        for entry in &fw.entries {
+            let _ = self.conn.destroy_window(entry.overlay);
+            let _ = self.conn.free_pixmap(entry.pixmap);
+        }
+        let _ = self.conn.flush();
+    }
+
     fn current_desktop(&self) -> Result<u32> {
         self.root_cardinals(b"_NET_CURRENT_DESKTOP", AtomEnum::CARDINAL, 1)?
             .into_iter()
@@ -718,6 +1350,7 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
 
     log::info!("RightKeys running; press Ctrl-C to stop");
     let mut app = String::new();
+    let mut find_window: Option<FindWindowOverlay> = None;
     // When a tap-hold key is held undecided, wait only until its timeout so the
     // hold modifier can be committed even if no other key follows.
     let mut hold_deadline: Option<Instant> = None;
@@ -752,6 +1385,61 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
             emit_raw(&mut virtual_device, event.code, event.value)?;
             continue;
         }
+
+        // While the find-window overlay is active, route presses to the hint
+        // navigator instead of the remapping engine. Releases are passed through
+        // the engine so modifier state (e.g. Hyper) stays consistent; repeats
+        // are dropped.
+        if find_window.is_some() {
+            if event.value == 2 {
+                continue;
+            }
+            if event.value == 0 {
+                if let Some(key) = Key::from_evdev_code(event.code) {
+                    emit(&mut virtual_device, &engine.on_event(key, 0, &app))?;
+                }
+                continue;
+            }
+            let (keep, activate_target) = {
+                let fw = find_window.as_mut().unwrap();
+                match Key::from_evdev_code(event.code) {
+                    Some(Key::Esc) => (false, None),
+                    Some(Key::Backspace) => {
+                        fw.backspace();
+                        (true, None)
+                    }
+                    Some(key) => match key_to_hint_char(key) {
+                        Some(ch) => match fw.input(ch) {
+                            Some(target) => (false, Some(target)),
+                            None => (true, None),
+                        },
+                        None => (true, None),
+                    },
+                    None => (true, None),
+                }
+            };
+            if keep {
+                if let Some(ref fw) = find_window {
+                    if let Err(err) = watcher.update_find_window_visibility(fw) {
+                        log::warn!("find-window update failed: {err:#}");
+                    }
+                }
+            } else {
+                let fw = find_window.take().unwrap();
+                watcher.destroy_find_window(fw);
+                // Releases here (selection or Esc) routed past the engine, so a
+                // modifier held to open the overlay never got its release. Drop
+                // any still-held modifiers so it is not left stuck down.
+                emit(&mut virtual_device, &engine.clear_modifiers())?;
+            }
+            if let Some(target) = activate_target {
+                if let Err(err) = watcher.activate_window(target) {
+                    log::warn!("find-window activate failed: {err:#}");
+                }
+            }
+            continue;
+        }
+
         // The active window only matters when deciding a fresh press; refresh it
         // there to keep X11 round-trips off the repeat/release hot path.
         if event.value == 1 {
@@ -768,7 +1456,12 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
                 emit(&mut virtual_device, &out)?;
                 // Perform any side effects the binding produced (launch/window).
                 for effect in engine.take_effects() {
-                    if let Err(err) = watcher.perform_effect(&effect) {
+                    if matches!(&effect, Effect::Window(WindowAction::FindWindow)) {
+                        match watcher.start_find_window() {
+                            Ok(overlay) => find_window = Some(overlay),
+                            Err(err) => log::warn!("find-window failed: {err:#}"),
+                        }
+                    } else if let Err(err) = watcher.perform_effect(&effect) {
                         log::warn!("effect {effect:?} failed: {err:#}");
                     }
                 }
@@ -998,11 +1691,147 @@ fn parse_wm_class(value: &[u8]) -> String {
     parts.next().or(instance).unwrap_or("").to_string()
 }
 
+/// Decode a window title from a `_NET_WM_NAME` (UTF-8) or `WM_NAME` (Latin-1,
+/// read lossily) property value, trimming whitespace and any trailing NUL.
+fn parse_window_name(value: &[u8]) -> String {
+    String::from_utf8_lossy(value)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string()
+}
+
+/// Serialize a [`TextImage`] into the server's Z-pixmap byte layout: one pixel
+/// per `(r, g, b)`, channels placed by `fmt`'s shifts, bytes ordered per the
+/// server's endianness, and each row padded to the scanline boundary.
+fn encode_image(fmt: &ImageFmt, img: &TextImage) -> Vec<u8> {
+    let row_bytes = img.width as usize * fmt.bytes_per_pixel;
+    let stride = row_bytes.div_ceil(fmt.scanline_pad_bytes) * fmt.scanline_pad_bytes;
+    let mut data = vec![0u8; stride * img.height as usize];
+    for y in 0..img.height as usize {
+        for x in 0..img.width as usize {
+            let (r, g, b) = img.pixels[y * img.width as usize + x];
+            let value = ((r as u32) << fmt.r_shift)
+                | ((g as u32) << fmt.g_shift)
+                | ((b as u32) << fmt.b_shift);
+            let off = y * stride + x * fmt.bytes_per_pixel;
+            for k in 0..fmt.bytes_per_pixel {
+                let shift = if fmt.lsb_first {
+                    8 * k
+                } else {
+                    8 * (fmt.bytes_per_pixel - 1 - k)
+                };
+                data[off + k] = (value >> shift) as u8;
+            }
+        }
+    }
+    data
+}
+
+/// Read the bytes of the system sans font, resolving it via `fc-match` and
+/// falling back to a few well-known paths.
+fn system_font_bytes() -> Result<Vec<u8>> {
+    if let Some(path) = fc_match_font() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Ok(bytes);
+        }
+    }
+    for path in FALLBACK_FONTS {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Ok(bytes);
+        }
+    }
+    Err(anyhow!(
+        "no system font found (install fontconfig, or a Noto/DejaVu sans font)"
+    ))
+}
+
+/// Ask `fc-match` for the file backing the default sans font.
+fn fc_match_font() -> Option<PathBuf> {
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", "sans"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Ask `fc-match` for the file of a font that contains the character `c`, used
+/// to render scripts the primary font lacks.
+fn fc_match_char(c: char) -> Option<String> {
+    let pattern = format!(":charset={:x}", c as u32);
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", &pattern])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_image_fills_and_outlines() {
+        let mut img = TextImage::new(4, 3, (1, 2, 3));
+        // Filled with the background color.
+        assert_eq!(img.pixels[0], (1, 2, 3));
+        img.draw_outline(0, 0, 4, 3, (9, 9, 9));
+        // Border pixel (corner) set, interior pixel untouched.
+        assert_eq!(img.pixels[0], (9, 9, 9));
+        assert_eq!(img.pixels[4 + 1], (1, 2, 3));
+        // Out-of-bounds writes are ignored, not panics.
+        img.set(99, 99, (0, 0, 0));
+    }
+
+    #[test]
+    fn text_image_blend_interpolates_by_coverage() {
+        let mut img = TextImage::new(1, 1, (0, 0, 0));
+        img.blend(0, 0, (100, 200, 50), 0.5);
+        assert_eq!(img.pixels[0], (50, 100, 25));
+        // Zero coverage is a no-op.
+        img.blend(0, 0, (255, 255, 255), 0.0);
+        assert_eq!(img.pixels[0], (50, 100, 25));
+    }
+
+    #[test]
+    fn encode_image_packs_bgrx_little_endian() {
+        // The common case: 32 bpp, LSB-first, masks R=0xff0000 G=0xff00 B=0xff.
+        let fmt = ImageFmt {
+            bytes_per_pixel: 4,
+            scanline_pad_bytes: 4,
+            lsb_first: true,
+            r_shift: 16,
+            g_shift: 8,
+            b_shift: 0,
+        };
+        let img = TextImage::new(1, 1, (0x12, 0x34, 0x56));
+        // Pixel 0x00123456 stored low-byte first: B, G, R, 0.
+        assert_eq!(encode_image(&fmt, &img), vec![0x56, 0x34, 0x12, 0x00]);
+    }
+
+    #[test]
+    fn encode_image_pads_rows_to_scanline() {
+        // 3 px wide at 4 bytes each = 12 bytes; padded up to a 8-byte scanline = 16.
+        let fmt = ImageFmt {
+            bytes_per_pixel: 4,
+            scanline_pad_bytes: 8,
+            lsb_first: true,
+            r_shift: 16,
+            g_shift: 8,
+            b_shift: 0,
+        };
+        let img = TextImage::new(3, 2, (0, 0, 0));
+        assert_eq!(encode_image(&fmt, &img).len(), 16 * 2);
+    }
 
     #[test]
     fn parses_wm_class_pair() {
@@ -1017,6 +1846,13 @@ mod tests {
     #[test]
     fn parses_wm_class_empty() {
         assert_eq!(parse_wm_class(b""), "");
+    }
+
+    #[test]
+    fn parses_window_name_trims_and_drops_nul() {
+        assert_eq!(parse_window_name(b"README.md - Editor\0"), "README.md - Editor");
+        assert_eq!(parse_window_name(b"  spaced  "), "spaced");
+        assert_eq!(parse_window_name(b""), "");
     }
 
     #[test]

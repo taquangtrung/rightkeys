@@ -109,6 +109,8 @@ pub enum WindowAction {
     AlwaysOnTop,
     /// Toggle showing the desktop (minimize/restore all windows).
     ShowDesktop,
+    /// Show a Vimium-style hint overlay to choose and focus any desktop window.
+    FindWindow,
     /// Move the window to the next/previous monitor, keeping its relative place.
     MoveToMonitor(CycleDirection),
     /// Activate the next/previous window of the same application.
@@ -442,6 +444,20 @@ impl Engine {
         let desired = real_only(&self.pressed_mods);
         let mut out = Vec::new();
         self.sync_mods(&desired, &mut out);
+        out
+    }
+
+    /// Release every modifier currently held, both at the OS output and in the
+    /// engine's tracked physical set, returning the events to emit. The backend
+    /// calls this when an input-capturing overlay (find-window) is dismissed:
+    /// while the overlay is up, key presses route to it rather than the engine,
+    /// so a modifier held to open it (e.g. `Super+f`) would otherwise stay stuck
+    /// down. Clearing the physical set too keeps a still-held modifier from being
+    /// re-pressed by the next keystroke and makes its eventual release a no-op.
+    pub fn clear_modifiers(&mut self) -> Vec<OutEvent> {
+        let mut out = Vec::new();
+        self.sync_mods(&BTreeSet::new(), &mut out);
+        self.pressed_mods.clear();
         out
     }
 
@@ -864,6 +880,22 @@ mod tests {
             engine.on_event(Key::LeftCtrl, 0, ""),
             vec![release(Key::LeftCtrl)]
         );
+    }
+
+    #[test]
+    fn clear_modifiers_releases_held_and_forgets_them() {
+        // A modifier held to open the find-window overlay must be released when
+        // the overlay is dismissed, and forgotten so it is neither re-pressed by
+        // the next key nor double-released when the physical key comes up.
+        let mut engine = Engine::new(Config::default());
+        assert_eq!(
+            engine.on_event(Key::LeftAlt, 1, ""),
+            vec![press(Key::LeftAlt)]
+        );
+        assert_eq!(engine.clear_modifiers(), vec![release(Key::LeftAlt)]);
+        // Already cleared: a second call and the eventual physical release are no-ops.
+        assert!(engine.clear_modifiers().is_empty());
+        assert!(engine.on_event(Key::LeftAlt, 0, "").is_empty());
     }
 
     #[test]

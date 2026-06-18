@@ -1,17 +1,17 @@
 # rightkeys Makefile (cross-platform)
 #
-# Build (both platforms):
+# `install` builds first, so a single command suffices. Under sudo it builds as
+# the invoking user, so `target/` is never left root-owned.
+#
+# Build only (both platforms):
 #     make build
 #
-# Linux install (system-wide; build as your user first):
-#     make build
-#     sudo make install
+# Linux install (system-wide):
+#     make install          # sudo is added automatically if PREFIX requires it
 # Linux install (current user only; ~/.local must be on PATH):
-#     make build
 #     make install PREFIX=$(HOME)/.local
 #
 # Windows install (per-user, no admin; needs PowerShell):
-#     make build
 #     make install
 # This copies rightkeys.exe to %LOCALAPPDATA%\Programs\rightkeys, seeds the
 # config, adds the folder to your user PATH, and creates a Startup shortcut so
@@ -25,15 +25,23 @@ CARGO ?= cargo
 
 all: build
 
+# Build the release binary. When invoked under sudo (e.g. `sudo make install`),
+# build as the original user via a login shell so cargo never writes root-owned
+# artifacts into target/ (or root's cargo cache) and still finds the user's
+# toolchain on PATH.
 build:
+ifneq ($(SUDO_USER),)
+	sudo -u $(SUDO_USER) bash -lc 'cd "$(CURDIR)" && $(CARGO) build --release'
+else
 	$(CARGO) build --release
+endif
 
 clean:
 	$(CARGO) clean
 
 help:
 	@echo Targets: build install install-config uninstall icons clean
-	@echo Run make build then make install
+	@echo Run make install (it builds first)
 
 ifeq ($(OS),Windows_NT)
 # ============================ Windows =================================
@@ -43,7 +51,7 @@ ifeq ($(OS),Windows_NT)
 WINPREFIX ?= $(LOCALAPPDATA)\Programs\rightkeys
 PS        := powershell -NoProfile -ExecutionPolicy Bypass
 
-install:
+install: build
 	$(PS) -File scripts/windows-setup.ps1 -Action install -Prefix "$(WINPREFIX)"
 
 install-config:
@@ -73,20 +81,20 @@ SVG        := assets/icons/rightkeys.svg
 DESKTOP    := assets/rightkeys.desktop
 BIN        := target/release/rightkeys
 
-install:
-	@test -x $(BIN) || { \
-		echo "error: $(BIN) not found. Run 'make build' first (as your user, not root)."; \
-		exit 1; \
-	}
-	install -Dm755 $(BIN) $(BINDIR)/rightkeys
+# Prepend sudo when PREFIX is not writable and we are not already root.
+# Override with SUDO= to disable.
+SUDO := $(if $(shell [ -w "$(PREFIX)" ] || [ "$$(id -u)" = "0" ] && echo y),,sudo)
+
+install: build
+	$(SUDO) install -Dm755 $(BIN) $(BINDIR)/rightkeys
 	for s in $(ICON_SIZES); do \
-		install -Dm644 assets/icons/rightkeys-$$s.png \
+		$(SUDO) install -Dm644 assets/icons/rightkeys-$$s.png \
 			$(ICONDIR)/$${s}x$${s}/apps/rightkeys.png; \
 	done
-	install -Dm644 $(SVG) $(ICONDIR)/scalable/apps/rightkeys.svg
-	install -Dm644 $(DESKTOP) $(APPDIR)/rightkeys.desktop
-	-update-desktop-database $(APPDIR) 2>/dev/null || true
-	-gtk-update-icon-cache -f -t $(ICONDIR) 2>/dev/null || true
+	$(SUDO) install -Dm644 $(SVG) $(ICONDIR)/scalable/apps/rightkeys.svg
+	$(SUDO) install -Dm644 $(DESKTOP) $(APPDIR)/rightkeys.desktop
+	-$(SUDO) update-desktop-database $(APPDIR) 2>/dev/null || true
+	-$(SUDO) gtk-update-icon-cache -f -t $(ICONDIR) 2>/dev/null || true
 	@echo "installed rightkeys to $(PREFIX)"
 
 uninstall:

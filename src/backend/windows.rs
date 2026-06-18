@@ -9,17 +9,22 @@
 // Imports
 
 use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    CloseHandle, BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, EnumDisplayMonitors, FillRect,
+    FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromWindow, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TextOutW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, FF_DONTCARE, FW_BOLD, FW_NORMAL, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT, VARIABLE_PITCH,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -36,14 +41,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, KillTimer, SetForegroundWindow,
-    SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GWL_EXSTYLE,
-    HC_ACTION, HHOOK, HWND_NOTOPMOST, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_EX_TOPMOST,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowLongW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, IsZoomed, KillTimer, RegisterClassExW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, GWLP_USERDATA, GWL_EXSTYLE, GW_OWNER, HC_ACTION, HHOOK, HWND_NOTOPMOST,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_PAINT,
+    WM_NCDESTROY, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use super::actions::findwindow::{
+    advance, key_to_hint_char, make_hints, place_hint, split_app_from_title, HintMatch,
+};
 use super::{Options, WindowWatcher};
 use crate::engine::{Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace};
 use crate::key::Key;
@@ -61,6 +74,38 @@ const PATH_BUF_LEN: usize = 512;
 /// click (which never reaches the hook), e.g. Shift/Ctrl-click multi-select.
 const TAP_HOLD_TIMEOUT_MS: u32 = 200;
 
+/// Window class name for the find-window hint chips.
+const HINT_CLASS: PCWSTR = w!("RightKeysHint");
+
+/// System UI font family used for the hint chips.
+const HINT_FACE: PCWSTR = w!("Segoe UI");
+
+/// Pixel heights of the three chip fonts: the hint key, the app name, and the
+/// smaller window-title line.
+const HINT_FONT_PX: i32 = 24;
+const APP_FONT_PX: i32 = 18;
+const INFO_FONT_PX: i32 = 15;
+
+/// Chip padding (pixels): inside the hint chip, inside the info chip, the
+/// vertical padding around the text, and the gap between the two info lines.
+const HINT_CHIP_PAD: i32 = 9;
+const APP_CHIP_PAD: i32 = 11;
+const OVERLAY_VPAD: i32 = 5;
+const INFO_LINE_GAP: i32 = 2;
+
+/// Chip colors. `0x00BBGGRR` packed for `COLORREF` (Win32's byte order).
+const HINT_BG: COLORREF = rgb(0x17, 0x25, 0x54);
+const HINT_FG: COLORREF = rgb(0x38, 0xbd, 0xf8);
+const HINT_BORDER: COLORREF = rgb(0x60, 0xa5, 0xfa);
+const APP_BG: COLORREF = rgb(0x23, 0x48, 0x7a);
+const APP_FG: COLORREF = rgb(0xe8, 0xee, 0xf6);
+const TITLE_FG: COLORREF = rgb(0xc4, 0xcf, 0xde);
+
+/// Pack `(r, g, b)` into a `COLORREF` (`0x00BBGGRR`).
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
 // Data Structures
 
 /// Engine plus window watcher, owned by the hook thread.
@@ -76,11 +121,50 @@ struct ForegroundWatcher {
     cached_app: String,
 }
 
+/// One hint chip bound to a target window. Its hint label lives at the same
+/// index in [`FindWindow::hints`].
+struct HintEntry {
+    overlay: HWND,
+    target: HWND,
+}
+
+/// Active state of the Vimium-style window-finder overlay.
+struct FindWindow {
+    entries: Vec<HintEntry>,
+    hints: Vec<String>,
+    prefix: String,
+}
+
+/// The three chip fonts, created once per overlay and reused while it is up.
+#[derive(Clone, Copy)]
+struct OverlayFonts {
+    hint: HFONT,
+    app: HFONT,
+    info: HFONT,
+}
+
+/// Per-chip data stored behind a window's `GWLP_USERDATA`, read by `WM_PAINT`.
+/// Strings are UTF-16 without a trailing NUL (as `TextOutW` wants them).
+struct ChipData {
+    hint: Vec<u16>,
+    app: Vec<u16>,
+    title: Vec<u16>,
+    hint_chip_w: i32,
+    width: i32,
+    height: i32,
+}
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static HOOK: Cell<HHOOK> = const { Cell::new(HHOOK(std::ptr::null_mut())) };
     /// Identifier of the active tap-hold timeout timer, or `0` when none is set.
     static TAP_HOLD_TIMER: Cell<usize> = const { Cell::new(0) };
+    /// The live find-window overlay, or `None` when it is not showing.
+    static FIND_WINDOW: RefCell<Option<FindWindow>> = const { RefCell::new(None) };
+    /// Fonts owned by the live overlay, freed when it tears down.
+    static OVERLAY_FONTS: Cell<Option<OverlayFonts>> = const { Cell::new(None) };
+    /// Whether the hint window class has been registered (once per process).
+    static HINT_CLASS_REGISTERED: Cell<bool> = const { Cell::new(false) };
 }
 
 // === ForegroundWatcher ===
@@ -134,6 +218,9 @@ pub fn run(engine: Engine, options: Options) -> Result<()> {
                 }
                 clear_tap_hold_timer();
             }
+            // Dispatch so the hint-overlay windows receive WM_PAINT.
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
 
         let _ = UnhookWindowsHookEx(hook);
@@ -176,6 +263,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     let vk = kb.vkCode as u16;
+
+    // While the find-window overlay is up, route keys to its navigator and
+    // swallow them so nothing reaches the apps underneath.
+    if FIND_WINDOW.with(|f| f.borrow().is_some()) {
+        handle_find_window_key(vk, value);
+        return LRESULT(1);
+    }
+
     let key = match Key::from_win_vk(vk) {
         Some(key) => key,
         None => {
@@ -564,6 +659,7 @@ fn perform_window(hwnd: HWND, action: WindowAction) {
                     }
                 }
             }
+            WindowAction::FindWindow => start_find_window(),
         }
     }
 }
@@ -802,6 +898,488 @@ fn resolve_desktop_index(target: Workspace) -> Option<u32> {
             Some((current + 1).min(count.saturating_sub(1)))
         }
     }
+}
+
+// === Find-window overlay ===
+
+/// This process's module handle, as an `HINSTANCE` for window/class creation.
+fn instance() -> HINSTANCE {
+    unsafe {
+        GetModuleHandleW(None)
+            .map(|m| HINSTANCE(m.0))
+            .unwrap_or(HINSTANCE(std::ptr::null_mut()))
+    }
+}
+
+/// Build and show the Vimium-style hint overlay over every alt-tab window, and
+/// store it as the live [`FIND_WINDOW`] so the hook routes keys to it.
+fn start_find_window() {
+    if FIND_WINDOW.with(|f| f.borrow().is_some()) {
+        return;
+    }
+    let hinst = instance();
+    register_hint_class(hinst);
+
+    let mut wins: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_alt_tab),
+            LPARAM(&mut wins as *mut Vec<HWND> as isize),
+        );
+    }
+    if wins.is_empty() {
+        return;
+    }
+
+    let hints = make_hints(wins.len());
+    let fonts = unsafe { create_fonts() };
+    OVERLAY_FONTS.with(|c| c.set(Some(fonts)));
+
+    let screen = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let dc = unsafe { GetDC(None) };
+    let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut entries = Vec::new();
+    let mut kept_hints = Vec::new();
+    for (hwnd, hint) in wins.iter().zip(hints.iter()) {
+        let title = window_title(*hwnd);
+        let app = process_name(*hwnd).unwrap_or_default();
+        // Line 1 shows the app's brand as it appears in the title, falling back
+        // to the process name; line 2 is the remaining document/page part.
+        let (brand, rest) = split_app_from_title(&title, &app);
+        let label = if brand.is_empty() { app } else { brand };
+        let chip = unsafe { layout_chip(dc, fonts, &hint.to_uppercase(), &label, &rest) };
+        let desired = window_rect(*hwnd).map(|r| (r.left, r.top)).unwrap_or((0, 0));
+        let (px, py) = place_hint(desired, (chip.width, chip.height), &placed, screen);
+        placed.push((px, py, chip.width, chip.height));
+        let overlay = unsafe { create_overlay_window(hinst, px, py, chip) };
+        if overlay.0.is_null() {
+            continue;
+        }
+        entries.push(HintEntry { overlay, target: *hwnd });
+        kept_hints.push(hint.clone());
+    }
+    unsafe {
+        ReleaseDC(None, dc);
+    }
+    if entries.is_empty() {
+        close_fonts();
+        return;
+    }
+    FIND_WINDOW.with(|f| {
+        *f.borrow_mut() = Some(FindWindow {
+            entries,
+            hints: kept_hints,
+            prefix: String::new(),
+        });
+    });
+}
+
+/// Route one key to the navigator while the overlay is up: Esc cancels,
+/// Backspace un-types, a hint character narrows or selects. On selection (or
+/// cancel) the overlay is torn down; on selection the target is activated and
+/// any modifier held to open the overlay is released.
+fn handle_find_window_key(vk: u16, value: i32) {
+    if value != 1 {
+        return; // suppress key-ups silently
+    }
+    enum Act {
+        Ignore,
+        Update,
+        Close(Option<HWND>),
+    }
+    let act = FIND_WINDOW.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(fw) = borrow.as_mut() else {
+            return Act::Ignore;
+        };
+        match Key::from_win_vk(vk) {
+            Some(Key::Esc) => Act::Close(None),
+            Some(Key::Backspace) => {
+                fw.prefix.pop();
+                Act::Update
+            }
+            Some(key) => match key_to_hint_char(key) {
+                Some(ch) => match advance(&fw.hints, &mut fw.prefix, ch) {
+                    HintMatch::Done(i) => Act::Close(Some(fw.entries[i].target)),
+                    HintMatch::Pending => Act::Update,
+                },
+                None => Act::Ignore,
+            },
+            None => Act::Ignore,
+        }
+    });
+    match act {
+        Act::Ignore => {}
+        Act::Update => update_find_window_visibility(),
+        Act::Close(target) => {
+            close_find_window();
+            if let Some(hwnd) = target {
+                activate(hwnd);
+            }
+            // The modifier that opened the overlay never saw its release routed
+            // through the engine, so drop it now (mirrors the X11 backend).
+            let releases = STATE.with(|state| {
+                state
+                    .borrow_mut()
+                    .as_mut()
+                    .map(|state| state.engine.clear_modifiers())
+                    .unwrap_or_default()
+            });
+            send_inputs(&releases);
+        }
+    }
+}
+
+/// Show chips whose hint still matches the current prefix; hide the rest.
+fn update_find_window_visibility() {
+    FIND_WINDOW.with(|cell| {
+        if let Some(fw) = cell.borrow().as_ref() {
+            for (entry, hint) in fw.entries.iter().zip(fw.hints.iter()) {
+                let cmd = if hint.starts_with(&fw.prefix) {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                };
+                unsafe {
+                    let _ = ShowWindow(entry.overlay, cmd);
+                }
+            }
+        }
+    });
+}
+
+/// Tear down the overlay: destroy its windows and free its fonts.
+fn close_find_window() {
+    if let Some(fw) = FIND_WINDOW.with(|cell| cell.borrow_mut().take()) {
+        for entry in &fw.entries {
+            unsafe {
+                let _ = DestroyWindow(entry.overlay);
+            }
+        }
+    }
+    close_fonts();
+}
+
+/// Free the overlay fonts, if any are live.
+fn close_fonts() {
+    if let Some(fonts) = OVERLAY_FONTS.with(|c| c.take()) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(fonts.hint.0));
+            let _ = DeleteObject(HGDIOBJ(fonts.app.0));
+            let _ = DeleteObject(HGDIOBJ(fonts.info.0));
+        }
+    }
+}
+
+/// [`EnumWindows`] callback: collect alt-tab-able top-level windows.
+unsafe extern "system" fn collect_alt_tab(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let wins = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+    if unsafe { is_alt_tab_window(hwnd) } {
+        wins.push(hwnd);
+    }
+    BOOL(1) // keep enumerating
+}
+
+/// Whether `hwnd` is a normal, user-switchable window: visible, titled, not a
+/// tool window, un-owned, and not cloaked (a hidden virtual-desktop/UWP shell).
+unsafe fn is_alt_tab_window(hwnd: HWND) -> bool {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+            return false;
+        }
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0 != 0 {
+            return false;
+        }
+        if !GetWindow(hwnd, GW_OWNER).unwrap_or_default().0.is_null() {
+            return false;
+        }
+        !is_cloaked(hwnd)
+    }
+}
+
+/// Whether the desktop window manager reports `hwnd` as cloaked (hidden).
+unsafe fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    unsafe {
+        let _ = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            size_of::<u32>() as u32,
+        );
+    }
+    cloaked != 0
+}
+
+/// A window's title text.
+fn window_title(hwnd: HWND) -> String {
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+}
+
+/// Register the hint window class once per process.
+fn register_hint_class(hinst: HINSTANCE) {
+    if HINT_CLASS_REGISTERED.with(|c| c.get()) {
+        return;
+    }
+    let wc = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(overlay_wndproc),
+        hInstance: hinst,
+        lpszClassName: HINT_CLASS,
+        ..Default::default()
+    };
+    unsafe {
+        RegisterClassExW(&wc);
+    }
+    HINT_CLASS_REGISTERED.with(|c| c.set(true));
+}
+
+/// Create the three chip fonts in the system UI face.
+unsafe fn create_fonts() -> OverlayFonts {
+    unsafe {
+        OverlayFonts {
+            hint: make_font(HINT_FONT_PX, true),
+            app: make_font(APP_FONT_PX, false),
+            info: make_font(INFO_FONT_PX, false),
+        }
+    }
+}
+
+/// Create one font of pixel height `px`, bold or regular, in [`HINT_FACE`].
+unsafe fn make_font(px: i32, bold: bool) -> HFONT {
+    let weight = if bold { FW_BOLD } else { FW_NORMAL };
+    unsafe {
+        CreateFontW(
+            -px,
+            0,
+            0,
+            0,
+            weight.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (VARIABLE_PITCH.0 | FF_DONTCARE.0) as u32,
+            HINT_FACE,
+        )
+    }
+}
+
+/// Measure and lay out one chip (no drawing), producing the [`ChipData`] stored
+/// behind the overlay window for painting.
+unsafe fn layout_chip(dc: HDC, fonts: OverlayFonts, hint: &str, app: &str, title: &str) -> ChipData {
+    let hint16 = to_wide_no_nul(hint);
+    let app16 = to_wide_no_nul(app);
+    let title16 = to_wide_no_nul(title);
+    let (hint_w, hint_h) = unsafe { text_extent(dc, fonts.hint, &hint16) };
+    let (app_w, app_h) = if app.is_empty() {
+        (0, 0)
+    } else {
+        unsafe { text_extent(dc, fonts.app, &app16) }
+    };
+    let (title_w, title_h) = if title.is_empty() {
+        (0, 0)
+    } else {
+        unsafe { text_extent(dc, fonts.info, &title16) }
+    };
+    let has_app = app_w > 0;
+    let has_title = title_w > 0;
+    let hint_chip_w = hint_w + HINT_CHIP_PAD * 2;
+    let info_w = if has_app || has_title {
+        app_w.max(title_w) + APP_CHIP_PAD * 2
+    } else {
+        0
+    };
+    let info_block = match (has_app, has_title) {
+        (true, true) => app_h + INFO_LINE_GAP + title_h,
+        (true, false) => app_h,
+        (false, true) => title_h,
+        (false, false) => 0,
+    };
+    let height = hint_h.max(info_block) + OVERLAY_VPAD * 2;
+    ChipData {
+        hint: hint16,
+        app: app16,
+        title: title16,
+        hint_chip_w,
+        width: hint_chip_w + info_w,
+        height,
+    }
+}
+
+/// The pixel `(width, height)` of `text` rendered with `font` on `dc`.
+unsafe fn text_extent(dc: HDC, font: HFONT, text: &[u16]) -> (i32, i32) {
+    unsafe {
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, text, &mut size);
+        SelectObject(dc, old);
+        (size.cx, size.cy)
+    }
+}
+
+/// Create one overlay window for a laid-out chip and show it without stealing
+/// focus. The [`ChipData`] is boxed behind `GWLP_USERDATA` for `WM_PAINT`.
+unsafe fn create_overlay_window(hinst: HINSTANCE, x: i32, y: i32, chip: ChipData) -> HWND {
+    let (w, h) = (chip.width, chip.height);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            HINT_CLASS,
+            PCWSTR::null(),
+            WS_POPUP,
+            x,
+            y,
+            w,
+            h,
+            None,
+            None,
+            hinst,
+            None,
+        )
+    }
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if !hwnd.0.is_null() {
+        let ptr = Box::into_raw(Box::new(chip));
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        }
+    }
+    hwnd
+}
+
+/// Window procedure for the hint chips: paint on demand, free the boxed
+/// [`ChipData`] on destroy, default otherwise.
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            unsafe { paint_overlay(hwnd) };
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ChipData;
+            if !ptr.is_null() {
+                drop(unsafe { Box::from_raw(ptr) });
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Paint a chip from its stored [`ChipData`] using the live overlay fonts.
+unsafe fn paint_overlay(hwnd: HWND) {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const ChipData;
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+    if !ptr.is_null() {
+        if let Some(fonts) = OVERLAY_FONTS.with(|c| c.get()) {
+            unsafe { draw_chip(hdc, &*ptr, fonts) };
+        }
+    }
+    unsafe {
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// Draw the two-chip label: a bordered hint chip on the left, then the app name
+/// above the window title on the right.
+unsafe fn draw_chip(hdc: HDC, data: &ChipData, fonts: OverlayFonts) {
+    let full = RECT {
+        left: 0,
+        top: 0,
+        right: data.width,
+        bottom: data.height,
+    };
+    let hint_rect = RECT {
+        left: 0,
+        top: 0,
+        right: data.hint_chip_w,
+        bottom: data.height,
+    };
+    unsafe {
+        fill(hdc, &full, APP_BG);
+        fill(hdc, &hint_rect, HINT_BG);
+        let border = CreateSolidBrush(HINT_BORDER);
+        let _ = FrameRect(hdc, &hint_rect, border);
+        let _ = DeleteObject(HGDIOBJ(border.0));
+        SetBkMode(hdc, TRANSPARENT);
+
+        let (_, hint_h) = text_extent(hdc, fonts.hint, &data.hint);
+        let hint_y = (data.height - hint_h) / 2;
+        draw_text(hdc, fonts.hint, HINT_CHIP_PAD, hint_y, HINT_FG, &data.hint);
+
+        let has_app = !data.app.is_empty();
+        let has_title = !data.title.is_empty();
+        let (_, app_h) = if has_app {
+            text_extent(hdc, fonts.app, &data.app)
+        } else {
+            (0, 0)
+        };
+        let (_, title_h) = if has_title {
+            text_extent(hdc, fonts.info, &data.title)
+        } else {
+            (0, 0)
+        };
+        let block = match (has_app, has_title) {
+            (true, true) => app_h + INFO_LINE_GAP + title_h,
+            (true, false) => app_h,
+            (false, true) => title_h,
+            (false, false) => 0,
+        };
+        let mut top = (data.height - block) / 2;
+        let x = data.hint_chip_w + APP_CHIP_PAD;
+        if has_app {
+            draw_text(hdc, fonts.app, x, top, APP_FG, &data.app);
+            top += app_h + INFO_LINE_GAP;
+        }
+        if has_title {
+            draw_text(hdc, fonts.info, x, top, TITLE_FG, &data.title);
+        }
+    }
+}
+
+/// Fill `rect` with a solid `color`.
+unsafe fn fill(hdc: HDC, rect: &RECT, color: COLORREF) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let _ = FillRect(hdc, rect, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+}
+
+/// Draw `text` at `(x, y)` in `color` with `font`.
+unsafe fn draw_text(hdc: HDC, font: HFONT, x: i32, y: i32, color: COLORREF, text: &[u16]) {
+    unsafe {
+        let old = SelectObject(hdc, HGDIOBJ(font.0));
+        SetTextColor(hdc, color);
+        let _ = TextOutW(hdc, x, y, text);
+        SelectObject(hdc, old);
+    }
+}
+
+/// UTF-16 encode `s` without a trailing NUL (as `TextOutW`/extent calls want).
+fn to_wide_no_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
 }
 
 // Tests

@@ -207,6 +207,7 @@ fn lower_window_action(node: &KdlNode) -> Result<WindowAction> {
             // Placeholder; the engine fills the real fraction from the tile cycle.
             fraction: 0.5,
         },
+        "find-window" => WindowAction::FindWindow,
         "maximize" => WindowAction::Maximize,
         "maximize-toggle" => WindowAction::MaximizeToggle,
         "minimize" => WindowAction::Minimize,
@@ -474,6 +475,16 @@ mod tests {
         assert!(matches!(
             preset.as_slice(),
             [Step::Window(WindowAction::Preset { w, h, anchor: None })] if *w == 0.6 && *h == 0.75
+        ));
+    }
+
+    #[test]
+    fn parses_find_window_action() {
+        let config = lower_str(r#"keymap { bind "Hyper+f" { wm action="find-window"; } }"#).unwrap();
+        let b = &config.keymaps[0].bindings;
+        assert!(matches!(
+            b.get(&Combo::parse("Hyper+f").unwrap()).unwrap().as_slice(),
+            [Step::Window(WindowAction::FindWindow)]
         ));
     }
 
