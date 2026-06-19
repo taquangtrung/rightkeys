@@ -150,7 +150,7 @@ fn default_config_path() -> Result<PathBuf> {
             PathBuf::from(home).join(".config")
         }
     };
-    Ok(base.join("rightkeys").join("config.kdl"))
+    Ok(base.join("rightkeys").join("settings.kdl"))
 }
 
 /// Render a path for display, abbreviating the home directory as `~`.
@@ -180,10 +180,10 @@ mod tests {
     fn abbreviates_home_prefix() {
         assert_eq!(
             abbreviate_home(
-                Path::new("/home/u/.config/rightkeys/config.kdl"),
+                Path::new("/home/u/.config/rightkeys/settings.kdl"),
                 Path::new("/home/u"),
             ),
-            "~/.config/rightkeys/config.kdl"
+            "~/.config/rightkeys/settings.kdl"
         );
     }
 

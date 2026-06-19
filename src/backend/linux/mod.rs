@@ -1,6 +1,11 @@
 //! Linux backend: grabs keyboards via `evdev`, injects through a `uinput`
 //! virtual device, and reads the active window's `WM_CLASS` over X11.
 
+// Submodules
+
+mod enumerator;
+mod executor;
+
 // Imports
 
 use std::collections::HashMap;
@@ -16,20 +21,23 @@ use evdev::{AttributeSet, Device, EventSummary, EventType, InputEvent, KeyCode};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-    ImageFormat, ImageOrder, Pixmap, Window, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt, CreateGCAux,
+    CreateWindowAux, EventMask, Gcontext, ImageFormat, ImageOrder, NotifyMode, Pixmap, Window,
+    WindowClass,
 };
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
-use super::actions::findwindow::{
+use super::actions::pickwindow::{
     advance, key_to_hint_char, make_hints, place_hint, split_app_from_title, HintMatch,
 };
 use super::{Options, WindowWatcher};
 use crate::engine::{
-    Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace,
+    Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace, STEP_DIVISOR,
 };
 use crate::key::Key;
+use super::actions::pickelement::{Element, HintAction, HintSession, HINT_CHARS};
 
 // Constants
 
@@ -68,36 +76,43 @@ const ANIM_STEPS: u32 = 16;
 /// transition duration (~128 ms).
 const ANIM_FRAME_PAUSE: Duration = Duration::from_millis(8);
 
-/// Pixel size the find-window overlay renders the hint key at. Larger than a
-/// core X bitmap font so the hints read clearly from across the screen.
-const OVERLAY_FONT_PX: f32 = 32.0;
+/// Pixel size the pick-window overlay renders the hint key at.
+const OVERLAY_FONT_PX: f32 = 26.0;
 
 /// Pixel size for the app-name line (the brand stripped from the title).
-const OVERLAY_APP_FONT_PX: f32 = 22.0;
+const OVERLAY_APP_FONT_PX: f32 = 20.0;
 
 /// Pixel size for the smaller window-title line beneath the app name.
-const OVERLAY_INFO_FONT_PX: f32 = 18.0;
+const OVERLAY_INFO_FONT_PX: f32 = 16.0;
+
+/// Font size for pick-element hint badges.
+const ELEMENT_HINT_FONT_PX: f32 = 16.0;
+
+/// Padding inside an element hint badge: 2 px vertical, 4 px horizontal.
+const ELEMENT_HINT_VPAD: i32 = 2;
+const ELEMENT_HINT_HPAD: i32 = 4;
 
 /// Vertical gap between the app-name and window-title lines (pixels).
-const INFO_LINE_GAP: i32 = 2;
+const INFO_LINE_GAP: i32 = 1;
 
 /// Maximum width of the app/title info text before it is truncated (pixels).
 const MAX_INFO_WIDTH_PX: i32 = 560;
 
 /// Vertical padding above and below the text inside an overlay chip (pixels).
-const OVERLAY_VPAD: i32 = 5;
+const OVERLAY_VPAD: i32 = 3;
 
 /// Horizontal padding inside the hint key chip (pixels on each side).
 const HINT_CHIP_PAD: i32 = 9;
 /// Horizontal padding inside the app-name chip (pixels on each side).
 const APP_CHIP_PAD: i32 = 11;
 
-/// Overlay chip colors as `(r, g, b)`: a navy hint chip with a sky-blue border
-/// and text, beside a steel-blue app chip with light-slate text.
-const HINT_BG: (u8, u8, u8) = (0x17, 0x25, 0x54);
-const HINT_FG: (u8, u8, u8) = (0x38, 0xbd, 0xf8);
-const HINT_BORDER: (u8, u8, u8) = (0x60, 0xa5, 0xfa);
-const APP_BG: (u8, u8, u8) = (0x23, 0x48, 0x7a);
+/// Overlay chip colors as `(r, g, b)`: ice-blue badge with deep-navy text and
+/// a medium-blue border. The pick-window info
+/// chip uses a slightly darker blue field with off-white text.
+const HINT_BG: (u8, u8, u8) = (0xca, 0xe0, 0xfa);
+const HINT_FG: (u8, u8, u8) = (0x29, 0x72, 0xb6);
+const HINT_BORDER: (u8, u8, u8) = (0x3b, 0x82, 0xf6);
+const APP_BG: (u8, u8, u8) = (0x1e, 0x40, 0x7a);
 const APP_FG: (u8, u8, u8) = (0xe8, 0xee, 0xf6);
 /// Window-title text: a light slate that reads as a subtitle under the app name.
 const TITLE_FG: (u8, u8, u8) = (0xc4, 0xcf, 0xde);
@@ -125,9 +140,9 @@ struct MoveCache {
     win: Window,
 }
 
-/// One entry in the find-window hint overlay: a target window with the
+/// One entry in the pick-window hint overlay: a target window with the
 /// override-redirect window and the pixmap holding its pre-rendered chip image.
-/// Its hint label lives at the same index in [`FindWindowOverlay::hints`].
+/// Its hint label lives at the same index in [`PickWindowOverlay::hints`].
 struct HintEntry {
     overlay: Window,
     pixmap: Pixmap,
@@ -135,10 +150,21 @@ struct HintEntry {
 }
 
 /// Active state of the Vimium-style window-finder overlay.
-struct FindWindowOverlay {
+struct PickWindowOverlay {
     entries: Vec<HintEntry>,
     hints: Vec<String>,
     prefix: String,
+}
+
+/// One element hint chip in the find-element overlay.
+struct ElementEntry {
+    overlay: Window,
+    pixmap: Pixmap,
+}
+
+/// Active state of the pick-element hint overlay.
+struct PickElementOverlay {
+    entries: Vec<ElementEntry>,
 }
 
 /// A CPU-rendered RGB image, row-major, used to compose an overlay chip before
@@ -178,9 +204,9 @@ struct OverlayRenderer {
     info_scale: PxScale,
 }
 
-// === FindWindowOverlay ===
+// === PickWindowOverlay ===
 
-impl FindWindowOverlay {
+impl PickWindowOverlay {
     /// Feed a hint character; returns the chosen target window once a single
     /// hint remains.
     fn input(&mut self, ch: char) -> Option<Window> {
@@ -448,6 +474,19 @@ impl OverlayRenderer {
         }
         img
     }
+
+    /// Render a small pick-element hint badge: just the key label, no info chip.
+    fn render_element_hint(&mut self, hint: &str) -> TextImage {
+        let scale = PxScale::from(ELEMENT_HINT_FONT_PX);
+        let line = self.line_height(scale);
+        let height = line + ELEMENT_HINT_VPAD * 2;
+        let width = self.text_width(hint, scale) + ELEMENT_HINT_HPAD * 2;
+        let mut img = TextImage::new(width as u16, height as u16, HINT_BG);
+        img.draw_outline(0, 0, width, height, HINT_BORDER);
+        let baseline = ELEMENT_HINT_VPAD as f32 + self.ascent(scale);
+        self.draw_text(&mut img, hint, ELEMENT_HINT_HPAD, baseline, scale, HINT_FG);
+        img
+    }
 }
 
 /// X11-based active-window watcher with a one-entry focus cache. Also performs
@@ -462,6 +501,10 @@ struct X11Watcher {
     /// Geometry to restore when a maximize-toggle un-fills the window we last
     /// filled; `None` once restored, or for a window we never filled.
     restore_geom: Option<(Window, (i32, i32, i32, i32))>,
+    /// True while another X11 client holds a keyboard grab (e.g. Rofi). When
+    /// set, `active_app` returns an empty string so no application-scoped
+    /// keymap matches and keys are forwarded raw.
+    keyboard_grabbed: bool,
 }
 
 // === X11Watcher ===
@@ -478,7 +521,62 @@ impl X11Watcher {
             cached_class: String::new(),
             last_move: None,
             restore_geom: None,
+            keyboard_grabbed: false,
         })
+    }
+
+    /// Subscribe to `FocusChangeMask` on `window` so we receive `FocusOut` with
+    /// `mode = Grab` when another client grabs the keyboard while `window` is focused.
+    fn subscribe_focus(&self, window: Window) {
+        if window > 1 {
+            let _ = self.conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::FOCUS_CHANGE),
+            );
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// Drain pending X11 events and update keyboard-grab state.
+    ///
+    /// `FocusOut(Grab)` on the tracked window means another client grabbed the
+    /// keyboard (e.g. Rofi); `FocusIn(Ungrab)` means the grab was released.
+    pub fn poll_focus_events(&mut self) {
+        while let Ok(Some(event)) = self.conn.poll_for_event() {
+            match event {
+                Event::FocusOut(ev)
+                    if ev.mode == NotifyMode::GRAB && ev.event == self.cached_focus =>
+                {
+                    self.keyboard_grabbed = true;
+                    self.cached_class = String::new();
+                }
+                // Any ungrab clears the flag. The matching grab was on our tracked
+                // window, but the releasing FocusIn can land on a different window
+                // when focus moved while grabbed (e.g. the grabbed window closed),
+                // so matching the window here would miss the release.
+                Event::FocusIn(ev) if ev.mode == NotifyMode::UNGRAB => {
+                    self.keyboard_grabbed = false;
+                    self.cached_focus = 0; // force refresh on next active_app() call
+                }
+                _ => {}
+            }
+        }
+        // Self-heal a stuck grab: if the window we are awaiting the ungrab on was
+        // destroyed (closed by the very shortcut whose grab we saw, e.g. Alt+Q
+        // closing the focused window), that FocusIn(Ungrab) never arrives. Drop
+        // the stale flag so remapping resumes instead of forwarding every key raw
+        // until a restart.
+        if self.keyboard_grabbed && !self.window_exists(self.cached_focus) {
+            self.keyboard_grabbed = false;
+            self.cached_focus = 0;
+        }
+    }
+
+    /// Whether `window` still exists on the server. A destroyed window yields a
+    /// `BadWindow` error on any request, which surfaces when the cookie's reply
+    /// is awaited.
+    fn window_exists(&self, window: Window) -> bool {
+        window != 0 && self.conn.get_geometry(window).is_ok_and(|c| c.reply().is_ok())
     }
 
     /// Read a window's `WM_CLASS` (the class half of the pair), walking up to
@@ -505,6 +603,9 @@ impl X11Watcher {
 
 impl WindowWatcher for X11Watcher {
     fn active_app(&mut self) -> String {
+        if self.keyboard_grabbed {
+            return String::new();
+        }
         let focus = match self.conn.get_input_focus().map(|cookie| cookie.reply()) {
             Ok(Ok(reply)) => reply.focus,
             _ => return self.cached_class.clone(),
@@ -512,6 +613,7 @@ impl WindowWatcher for X11Watcher {
         if focus != self.cached_focus {
             self.cached_focus = focus;
             self.cached_class = self.wm_class(focus).unwrap_or_default();
+            self.subscribe_focus(focus);
         }
         self.cached_class.clone()
     }
@@ -588,6 +690,24 @@ impl X11Watcher {
                 self.unmaximize(win)?;
                 self.move_resize(win, x, y, w, h)?;
             }
+            WindowAction::StepToward(corner) => {
+                if self.wm_class(win).as_deref() == Some("xfce4-panel") {
+                    return Ok(());
+                }
+                let (ax, ay, aw, ah) = self.work_area()?;
+                let (x, y, w, h) = self.current_geometry(win)?;
+                let (tx, ty) = anchor_pos(ax, ay, aw, ah, w, h, Some(corner));
+                let rdx = (tx - x) as f64;
+                let rdy = (ty - y) as f64;
+                let dist = rdx.hypot(rdy);
+                let mag = (aw as f64).hypot(ah as f64) / STEP_DIVISOR as f64;
+                let (nx, ny) = if dist <= mag {
+                    (tx, ty)
+                } else {
+                    (x + (rdx * mag / dist).round() as i32, y + (rdy * mag / dist).round() as i32)
+                };
+                self.move_resize(win, nx, ny, w, h)?;
+            }
             WindowAction::Corner(corner) => {
                 let (ax, ay, aw, ah) = self.work_area()?;
                 let (w, h) = (aw / 2, ah / 2);
@@ -639,7 +759,8 @@ impl X11Watcher {
             WindowAction::AlwaysOnTop => self.toggle_above(win)?,
             WindowAction::MoveToMonitor(direction) => self.move_to_monitor(win, direction)?,
             WindowAction::CycleSameApp(direction) => self.cycle_same_app(win, direction)?,
-            WindowAction::FindWindow => {} // intercepted in run() before perform_effect
+            WindowAction::PickWindow => {} // intercepted in run() before perform_effect
+            WindowAction::PickElement => {} // intercepted in run() before perform_effect
             WindowAction::Workspace { .. } | WindowAction::ShowDesktop => {
                 unreachable!("handled above")
             }
@@ -649,7 +770,14 @@ impl X11Watcher {
 
     /// Activate an existing window whose `WM_CLASS` matches `program`, else launch it.
     fn activate_or_launch(&self, program: &str) -> Result<()> {
-        let stem = program.rsplit('/').next().unwrap_or(program).to_lowercase();
+        // Split shell-style so an argument can contain spaces when quoted, e.g.
+        //   exec linux="raise-or-run.sh -w 'Brave-browser:Google Scholar' -c run.sh"
+        let args = shell_words::split(program)
+            .with_context(|| format!("parsing exec command {program:?}"))?;
+        let Some((bin, rest)) = args.split_first() else {
+            return Ok(());
+        };
+        let stem = bin.rsplit('/').next().unwrap_or(bin).to_lowercase();
         if let Ok(list) = self.client_list() {
             for win in list {
                 if let Some(class) = self.wm_class(win) {
@@ -659,14 +787,9 @@ impl X11Watcher {
                 }
             }
         }
-        // No window found: launch the program (first whitespace-separated token
-        // is the binary, the rest are arguments).
-        let mut parts = program.split_whitespace();
-        let Some(bin) = parts.next() else {
-            return Ok(());
-        };
+        // No window found: launch the binary with its parsed arguments.
         std::process::Command::new(bin)
-            .args(parts)
+            .args(rest)
             .spawn()
             .with_context(|| format!("launching {program:?}"))?;
         Ok(())
@@ -927,11 +1050,11 @@ impl X11Watcher {
         self.send_root_message(win, atom, [2, CURRENT_TIME, 0, 0, 0])
     }
 
-    // ── find-window overlay ──
+    // ── pick-window overlay ──
 
     /// Build and display the Vimium-style hint overlay over every window on the
     /// current desktop; returns the overlay state for key-event routing.
-    fn start_find_window(&mut self) -> Result<FindWindowOverlay> {
+    fn start_pick_window(&mut self) -> Result<PickWindowOverlay> {
         // Pipeline all atoms before waiting for any reply.
         let desktop_atom_c = self.conn.intern_atom(false, b"_NET_CURRENT_DESKTOP")?;
         let client_list_atom_c = self.conn.intern_atom(false, b"_NET_CLIENT_LIST")?;
@@ -997,34 +1120,32 @@ impl X11Watcher {
                 self.conn.get_property(false, w, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
             })
             .collect::<std::result::Result<_, _>>()?;
+        let geo_cs: Vec<_> = wins
+            .iter()
+            .map(|&w| self.conn.get_geometry(w))
+            .collect::<std::result::Result<_, _>>()?;
 
         let windows: Vec<(Window, (i32, i32), String, String)> = desk_cs
             .into_iter()
             .zip(coord_cs)
             .zip(fext_cs)
+            .zip(geo_cs)
             .zip(class_cs)
             .zip(name_cs)
             .zip(wmname_cs)
             .zip(wins)
-            .filter_map(|((((((d, c), f), k), n), wn), win)| {
+            .filter_map(|(((((((d, c), f), g), k), n), wn), win)| {
                 let win_desktop = d.reply().ok()?.value32()?.next()?;
                 if win_desktop != desktop {
                     return None;
                 }
                 let coords = c.reply().ok()?;
-                let (left, top) = f
-                    .reply()
-                    .ok()
-                    .and_then(|r| {
-                        let mut it = r.value32()?;
-                        let left = it.next()? as i32;
-                        let _right = it.next()?;
-                        let top = it.next()? as i32;
-                        Some((left, top))
-                    })
-                    .unwrap_or((0, 0));
-                let x = coords.dst_x as i32 - left;
-                let y = coords.dst_y as i32 - top;
+                // fext cookie consumed; frame extents are not needed for centering.
+                let _ = f.reply();
+                let client_geo = g.reply().ok()?;
+                // Center of the client area in root coordinates.
+                let cx = coords.dst_x as i32 + client_geo.width as i32 / 2;
+                let cy = coords.dst_y as i32 + client_geo.height as i32 / 2;
                 let app =
                     k.reply().ok().map(|r| parse_wm_class(&r.value)).unwrap_or_default();
                 let title = n
@@ -1040,7 +1161,7 @@ impl X11Watcher {
                 // the remaining document/page part.
                 let (brand, rest) = split_app_from_title(&title, &app);
                 let label = if brand.is_empty() { app } else { brand };
-                Some((win, (x, y), label, rest))
+                Some((win, (cx, cy), label, rest))
             })
             .collect();
 
@@ -1050,7 +1171,7 @@ impl X11Watcher {
 
         let hints = make_hints(windows.len());
         let mut renderer =
-            OverlayRenderer::load().context("loading the find-window overlay font")?;
+            OverlayRenderer::load().context("loading the pick-window overlay font")?;
         let fmt = self.image_fmt()?;
         // One scratch GC drives every `put_image`; freed once the chips are up.
         let upload_gc: Gcontext = self.conn.generate_id()?;
@@ -1064,11 +1185,12 @@ impl X11Watcher {
         let screen = (screen_w as i32, screen_h as i32);
         let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
         let mut entries = Vec::new();
-        for ((win, (x, y), app, title), hint) in windows.iter().zip(hints.iter()) {
+        for ((win, (cx, cy), app, title), hint) in windows.iter().zip(hints.iter()) {
             let img = renderer.render_label(&hint.to_uppercase(), app, title);
             let pixmap = self.upload_image(&fmt, upload_gc, depth, &img)?;
             let size = (img.width as i32, img.height as i32);
-            let (px, py) = place_hint((*x, *y), size, &placed, screen);
+            let desired = (cx - size.0 / 2, cy - size.1 / 2);
+            let (px, py) = place_hint(desired, size, &placed, screen);
             placed.push((px, py, size.0, size.1));
 
             let overlay: Window = self.conn.generate_id()?;
@@ -1098,7 +1220,7 @@ impl X11Watcher {
         self.conn.free_gc(upload_gc)?;
         self.conn.flush()?;
 
-        Ok(FindWindowOverlay {
+        Ok(PickWindowOverlay {
             entries,
             hints,
             prefix: String::new(),
@@ -1162,7 +1284,7 @@ impl X11Watcher {
     /// Show overlays whose hint still matches `fw.prefix`; hide the rest. The
     /// chip image is the window's background pixmap, so a freshly mapped overlay
     /// only needs a `clear_area` to repaint it.
-    fn update_find_window_visibility(&self, fw: &FindWindowOverlay) -> Result<()> {
+    fn update_pick_window_visibility(&self, fw: &PickWindowOverlay) -> Result<()> {
         for (entry, hint) in fw.entries.iter().zip(fw.hints.iter()) {
             if hint.starts_with(&fw.prefix) {
                 self.conn.map_window(entry.overlay)?;
@@ -1176,8 +1298,136 @@ impl X11Watcher {
     }
 
     /// Destroy all overlay windows and free their pixmaps.
-    fn destroy_find_window(&self, fw: FindWindowOverlay) {
+    fn destroy_pick_window(&self, fw: PickWindowOverlay) {
         for entry in &fw.entries {
+            let _ = self.conn.destroy_window(entry.overlay);
+            let _ = self.conn.free_pixmap(entry.pixmap);
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// The PID of the focused X11 window's process, for AT-SPI matching.
+    fn focused_pid(&self) -> Option<u32> {
+        let atom = self.atom(b"_NET_WM_PID").ok()?;
+        // Try the X input focus first (catches apps whose focused child window
+        // carries the PID, e.g. browsers with embedded render widgets), then
+        // fall back to the EWMH active window.
+        let focus = self.conn.get_input_focus().ok()?.reply().ok()?.focus;
+        if let Some(pid) = self.window_pid(focus, atom) {
+            return Some(pid);
+        }
+        let active = self.active_window().ok()??;
+        self.window_pid(active, atom)
+    }
+
+    /// Climb the X window tree from `win` toward the root returning the first
+    /// `_NET_WM_PID` found, or `None` if none is set before reaching root.
+    fn window_pid(&self, mut win: Window, atom: u32) -> Option<u32> {
+        if win < 2 {
+            return None;
+        }
+        loop {
+            let reply = self
+                .conn
+                .get_property(false, win, atom, AtomEnum::CARDINAL, 0, 1)
+                .ok()?
+                .reply()
+                .ok()?;
+            if reply.value_len > 0 {
+                return reply.value32()?.next();
+            }
+            let tree = self.conn.query_tree(win).ok()?.reply().ok()?;
+            if tree.parent == 0 || tree.parent == self.root {
+                return None;
+            }
+            win = tree.parent;
+        }
+    }
+
+    /// The client geometry of the active window, for AT-SPI window matching.
+    ///
+    /// Uses the raw client bounds (no frame-extents expansion) because AT-SPI
+    /// reports window extents as the client area; matching against client bounds
+    /// gives the highest overlap score for the correct window.
+    fn active_bounds(&mut self) -> Option<(i32, i32, i32, i32)> {
+        let win = self.active_window().ok()??;
+        self.client_geometry(win).ok()
+    }
+
+    /// Build and show the element-hint overlay from `pairs` returned by a
+    /// completed hint enumeration.
+    fn start_pick_element(
+        &mut self,
+        pairs: Vec<(Element, String)>,
+    ) -> Result<PickElementOverlay> {
+        if pairs.is_empty() {
+            anyhow::bail!("no elements to show");
+        }
+        let mut renderer =
+            OverlayRenderer::load().context("loading element overlay font")?;
+        let fmt = self.image_fmt()?;
+        let upload_gc: Gcontext = self.conn.generate_id()?;
+        self.conn.create_gc(upload_gc, self.root, &CreateGCAux::new())?;
+
+        let screen = &self.conn.setup().roots[self.screen_num];
+        let screen_size = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
+        let depth = screen.root_depth;
+
+        let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut entries: Vec<ElementEntry> = Vec::new();
+
+        for (element, hint) in &pairs {
+            let img = renderer.render_element_hint(&hint.to_uppercase());
+            let pixmap = self.upload_image(&fmt, upload_gc, depth, &img)?;
+            let size = (img.width as i32, img.height as i32);
+            let (px, py) = place_hint((element.x, element.y), size, &placed, screen_size);
+            placed.push((px, py, size.0, size.1));
+
+            let overlay: Window = self.conn.generate_id()?;
+            self.conn.create_window(
+                0u8,
+                overlay,
+                self.root,
+                px as i16,
+                py as i16,
+                img.width,
+                img.height,
+                0u16,
+                WindowClass::INPUT_OUTPUT,
+                0u32,
+                &CreateWindowAux::new()
+                    .background_pixmap(pixmap)
+                    .override_redirect(1u32),
+            )?;
+            self.conn.map_window(overlay)?;
+            entries.push(ElementEntry { overlay, pixmap });
+        }
+        self.conn.free_gc(upload_gc)?;
+        self.conn.flush()?;
+        Ok(PickElementOverlay { entries })
+    }
+
+    /// Show/hide element chips according to `matched[i]` (parallel to `entries`).
+    fn update_pick_element_visibility(
+        &self,
+        fe: &PickElementOverlay,
+        matched: &[bool],
+    ) -> Result<()> {
+        for (entry, &visible) in fe.entries.iter().zip(matched.iter()) {
+            if visible {
+                self.conn.map_window(entry.overlay)?;
+                self.conn.clear_area(false, entry.overlay, 0, 0, 0, 0)?;
+            } else {
+                self.conn.unmap_window(entry.overlay)?;
+            }
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Destroy all element-hint overlay windows and free their pixmaps.
+    fn destroy_pick_element(&self, fe: PickElementOverlay) {
+        for entry in &fe.entries {
             let _ = self.conn.destroy_window(entry.overlay);
             let _ = self.conn.free_pixmap(entry.pixmap);
         }
@@ -1350,20 +1600,66 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
 
     log::info!("RightKeys running; press Ctrl-C to stop");
     let mut app = String::new();
-    let mut find_window: Option<FindWindowOverlay> = None;
+    let mut pick_window: Option<PickWindowOverlay> = None;
+    let mut pick_element: Option<PickElementOverlay> = None;
+    // Channel populated while AT-SPI hint enumeration is in flight.
+    let mut hints_rx: Option<Receiver<Vec<Element>>> = None;
+    // Standalone hint session active when pick-element was triggered.
+    let mut hint_session: Option<HintSession> = None;
     // When a tap-hold key is held undecided, wait only until its timeout so the
     // hold modifier can be committed even if no other key follows.
     let mut hold_deadline: Option<Instant> = None;
     loop {
-        let event = match hold_deadline {
+        // Deadlines: hold commit, hints poll (50 ms), and an always-on
+        // config-reload poll so editing the config applies live even while idle
+        // (no key press needed to wake up).
+        let hints_deadline: Option<Instant> = hints_rx
+            .as_ref()
+            .map(|_| Instant::now() + Duration::from_millis(50));
+        let reload_deadline = Instant::now() + Duration::from_secs(1);
+        let combined_deadline = [hold_deadline, hints_deadline]
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(reload_deadline))
+            .min();
+        let event = match combined_deadline {
             Some(deadline) => {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(event) => event,
                     Err(RecvTimeoutError::Timeout) => {
-                        if crate::tray::is_enabled() {
-                            emit(&mut virtual_device, &engine.flush_pending_hold())?;
+                        // Apply a live-reloaded config even while idle so a
+                        // config edit takes effect without a key press.
+                        apply_pending_reload(&mut engine);
+                        // Check if the hold deadline actually expired.
+                        if hold_deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+                            if crate::tray::is_enabled() {
+                                emit(&mut virtual_device, &engine.flush_pending_hold())?;
+                            }
+                            hold_deadline = None;
                         }
-                        hold_deadline = None;
+                        // Check if hints results have arrived.
+                        if let Some(ref hr) = hints_rx {
+                            if let Ok(elements) = hr.try_recv() {
+                                hints_rx = None;
+                                let (hs, pairs) = HintSession::new(elements, HINT_CHARS);
+                                // Only enter the session when there is something
+                                // to pick, so empty results don't trap input.
+                                if !pairs.is_empty() {
+                                    hint_session = Some(hs);
+                                }
+                                if pairs.is_empty() {
+                                    crate::notify::info("No window elements detected");
+                                    // Modifier releases were swallowed while awaiting hints;
+                                    // drop any still-held modifiers so none stays stuck down.
+                                    emit(&mut virtual_device, &engine.clear_modifiers())?;
+                                } else {
+                                    match watcher.start_pick_element(pairs) {
+                                        Ok(overlay) => pick_element = Some(overlay),
+                                        Err(err) => log::warn!("find-element failed: {err:#}"),
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -1376,21 +1672,18 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
         };
 
         // Apply a live-reloaded config, if one is ready.
-        if let Some(config) = crate::reload::take() {
-            engine.set_config(config);
-            crate::notify::info("RightKeys reloaded!");
-        }
+        apply_pending_reload(&mut engine);
         // When paused from the tray, forward every key untouched.
         if !crate::tray::is_enabled() {
             emit_raw(&mut virtual_device, event.code, event.value)?;
             continue;
         }
 
-        // While the find-window overlay is active, route presses to the hint
+        // While the pick-window overlay is active, route presses to the hint
         // navigator instead of the remapping engine. Releases are passed through
         // the engine so modifier state (e.g. Hyper) stays consistent; repeats
         // are dropped.
-        if find_window.is_some() {
+        if pick_window.is_some() {
             if event.value == 2 {
                 continue;
             }
@@ -1401,7 +1694,7 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
                 continue;
             }
             let (keep, activate_target) = {
-                let fw = find_window.as_mut().unwrap();
+                let fw = pick_window.as_mut().unwrap();
                 match Key::from_evdev_code(event.code) {
                     Some(Key::Esc) => (false, None),
                     Some(Key::Backspace) => {
@@ -1419,14 +1712,14 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
                 }
             };
             if keep {
-                if let Some(ref fw) = find_window {
-                    if let Err(err) = watcher.update_find_window_visibility(fw) {
-                        log::warn!("find-window update failed: {err:#}");
+                if let Some(ref fw) = pick_window {
+                    if let Err(err) = watcher.update_pick_window_visibility(fw) {
+                        log::warn!("pick-window update failed: {err:#}");
                     }
                 }
             } else {
-                let fw = find_window.take().unwrap();
-                watcher.destroy_find_window(fw);
+                let fw = pick_window.take().unwrap();
+                watcher.destroy_pick_window(fw);
                 // Releases here (selection or Esc) routed past the engine, so a
                 // modifier held to open the overlay never got its release. Drop
                 // any still-held modifiers so it is not left stuck down.
@@ -1434,17 +1727,95 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
             }
             if let Some(target) = activate_target {
                 if let Err(err) = watcher.activate_window(target) {
-                    log::warn!("find-window activate failed: {err:#}");
+                    log::warn!("pick-window activate failed: {err:#}");
                 }
             }
             continue;
         }
 
-        // The active window only matters when deciding a fresh press; refresh it
-        // there to keep X11 round-trips off the repeat/release hot path.
+        // Refresh the active app name on presses; releases and repeats use the
+        // cached value to keep X11 round-trips off the hot path.
         if event.value == 1 {
+            watcher.poll_focus_events();
             app = watcher.active_app();
         }
+
+        // Another X11 client holds a keyboard grab (e.g. a KVM/VirtualBox VM):
+        // bypass all remapping and forward keys raw so the VM receives them
+        // unmodified.
+        if watcher.keyboard_grabbed || engine.is_pass_through(&app) {
+            // Forward raw, but keep the engine's modifier tracking in sync so a
+            // modifier released while the grab/pass-through was active is not
+            // left "stuck on" in the pressed set once normal remapping resumes.
+            if let Some(key) = Key::from_evdev_code(event.code) {
+                engine.track_passthrough(key, event.value);
+            }
+            emit_raw(&mut virtual_device, event.code, event.value)?;
+            continue;
+        }
+
+        // Standalone hint session: intercept key events when pick-element is
+        // active (overlay up, or enumeration still in flight). Both presses and
+        // releases are swallowed. `hints_rx.is_some()` covers the brief window
+        // between triggering pick-element and the AT-SPI results arriving, so no
+        // key slips through to the app before the overlay appears.
+        if hint_session.is_some() || hints_rx.is_some() {
+            if let Some(key) = Key::from_evdev_code(event.code) {
+                if event.value != 0 {
+                    // Press or repeat: route to the hint session if it exists.
+                    if let Some(hs) = &mut hint_session {
+                        match hs.process_key(key) {
+                            HintAction::Updated => {
+                                if let Some(fe) = pick_element.as_ref() {
+                                    let matched: Vec<bool> =
+                                        hs.matched_hints().map(|(_, _, m)| m).collect();
+                                    if let Err(err) =
+                                        watcher.update_pick_element_visibility(fe, &matched)
+                                    {
+                                        log::warn!("find-element update failed: {err:#}");
+                                    }
+                                }
+                            }
+                            HintAction::Activate(elem) => {
+                                if let Some(fe) = pick_element.take() {
+                                    watcher.destroy_pick_element(fe);
+                                }
+                                hint_session = None;
+                                // Key releases routed past the engine while the
+                                // hints were up, so a modifier held to trigger
+                                // pick-element never got its release. Drop any
+                                // still-held modifiers so none is left stuck down.
+                                emit(&mut virtual_device, &engine.clear_modifiers())?;
+                                thread::spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("tokio runtime for element activation");
+                                    if let Err(err) =
+                                        rt.block_on(crate::backend::linux::executor::execute(&elem))
+                                    {
+                                        log::warn!("element activation failed: {err:#}");
+                                    }
+                                });
+                            }
+                            HintAction::Dismiss => {
+                                if let Some(fe) = pick_element.take() {
+                                    watcher.destroy_pick_element(fe);
+                                }
+                                hint_session = None;
+                                // Esc's release (and the trigger modifier's) were
+                                // routed past the engine while the hints were up;
+                                // drop any still-held modifiers so none stays stuck.
+                                emit(&mut virtual_device, &engine.clear_modifiers())?;
+                            }
+                            HintAction::Suppressed => {}
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         match Key::from_evdev_code(event.code) {
             Some(key) => {
                 let out = engine.on_event(key, event.value, &app);
@@ -1456,13 +1827,32 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
                 emit(&mut virtual_device, &out)?;
                 // Perform any side effects the binding produced (launch/window).
                 for effect in engine.take_effects() {
-                    if matches!(&effect, Effect::Window(WindowAction::FindWindow)) {
-                        match watcher.start_find_window() {
-                            Ok(overlay) => find_window = Some(overlay),
-                            Err(err) => log::warn!("find-window failed: {err:#}"),
+                    if matches!(&effect, Effect::Window(WindowAction::PickWindow)) {
+                        match watcher.start_pick_window() {
+                            Ok(overlay) => pick_window = Some(overlay),
+                            Err(err) => log::warn!("pick-window failed: {err:#}"),
                         }
+                    } else if matches!(&effect, Effect::Window(WindowAction::PickElement)) {
+                        let pid = watcher.focused_pid();
+                        let bounds = watcher.active_bounds();
+                        let (hints_tx, hints_rx_new) = mpsc::channel();
+                        hints_rx = Some(hints_rx_new);
+                        thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio runtime for AT-SPI enumeration");
+                            let elements = rt
+                                .block_on(crate::backend::linux::enumerator::enumerate(pid, bounds))
+                                .unwrap_or_else(|e| {
+                                    log::warn!("AT-SPI enumeration failed: {e:#}");
+                                    Vec::new()
+                                });
+                            let _ = hints_tx.send(elements);
+                        });
                     } else if let Err(err) = watcher.perform_effect(&effect) {
                         log::warn!("effect {effect:?} failed: {err:#}");
+                        crate::notify::warn(&format!("{err}"));
                     }
                 }
             }
@@ -1487,10 +1877,34 @@ pub fn run(mut engine: Engine, options: Options) -> Result<()> {
     Ok(())
 }
 
+/// Apply a pending live-reloaded config, if one is ready. Returns `true` when a
+/// config was applied.
+fn apply_pending_reload(engine: &mut Engine) -> bool {
+    let Some(config) = crate::reload::take() else {
+        return false;
+    };
+    engine.set_config(config);
+    crate::notify::info("RightKeys reloaded!");
+    true
+}
+
 fn read_device(mut device: Device, tx: Sender<InEvent>) {
     loop {
         let events = match device.fetch_events() {
             Ok(events) => events,
+            // A blocking `read()` returns EINTR whenever a signal (e.g. SIGCHLD
+            // from a spawned `notify-send`/`xdotool`, or a tokio/zbus signal)
+            // lands on this thread; EAGAIN can surface likewise. Both are
+            // transient: retry rather than letting the reader die, which would
+            // silently stop every remap until a restart.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(err) => {
                 log::warn!("device read error: {err}");
                 return;

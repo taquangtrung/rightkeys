@@ -1,4 +1,4 @@
-//! Portable find-window overlay logic shared by the platform backends: hint
+//! Portable pick-window overlay logic shared by the platform backends: hint
 //! label generation, key→hint mapping, the prefix navigator, and extracting the
 //! application-name component from a window title. Window enumeration and the
 //! on-screen rendering of the hint chips are backend-specific.
@@ -9,7 +9,7 @@ use crate::key::Key;
 
 // Constants
 
-/// Hint key sequence for the find-window overlay (home-row keys first).
+/// Hint key sequence for the pick-window overlay (home-row keys first).
 const HINT_KEYS: &[char] = &[
     'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't',
     'y', 'u', 'i', 'o', 'p', 'z', 'x', 'c', 'v', 'b', 'n', 'm',

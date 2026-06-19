@@ -27,7 +27,7 @@ mod imp {
 
     // Constants
 
-    /// Embedded 32x32 RGBA icon shown in the tray.
+    /// Embedded 32x32 RGBA application icon.
     const ICON_PNG: &[u8] = include_bytes!("../assets/icons/rightkeys-32.png");
 
     /// Hover text for the tray icon, by remapping state.

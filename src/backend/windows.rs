@@ -29,7 +29,21 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
+    IUIAutomationElementArray, TreeScope_Descendants, UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_EditControlTypeId,
+    UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+    UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_SpinnerControlTypeId,
+    UIA_TabItemControlTypeId, UIA_ToggleButtonControlTypeId, UIA_TreeItemControlTypeId,
+};
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
     QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
@@ -46,25 +60,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     IsWindowVisible, IsZoomed, KillTimer, RegisterClassExW, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-    UnhookWindowsHookEx, GWLP_USERDATA, GWL_EXSTYLE, GW_OWNER, HC_ACTION, HHOOK, HWND_NOTOPMOST,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    PostThreadMessageW, UnhookWindowsHookEx, GWLP_USERDATA, GWL_EXSTYLE, GW_OWNER, HC_ACTION,
+    HHOOK, HWND_NOTOPMOST, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, SM_CXSCREEN, SM_CYSCREEN,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
-    SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_PAINT,
-    WM_NCDESTROY, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
+    WM_NCDESTROY, WM_PAINT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use super::actions::findwindow::{
+use super::actions::pickwindow::{
     advance, key_to_hint_char, make_hints, place_hint, split_app_from_title, HintMatch,
 };
 use super::{Options, WindowWatcher};
-use crate::engine::{Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace};
+use crate::engine::{Corner, CycleDirection, Effect, Engine, OutEvent, Side, WindowAction, Workspace, STEP_DIVISOR};
 use crate::key::Key;
+use super::actions::pickelement::{Element, HintAction, HintSession, HINT_CHARS};
 
 // Constants
 
 /// Tag stamped into `dwExtraInfo` of injected events so the hook ignores them.
 const INJECT_MARKER: usize = 0x5249_4748; // "RIGH"
+
+/// Thread message: UIA element enumeration completed.
+/// `wParam` holds a `Box<Vec<Element>>` raw pointer.
+const WM_PICK_ELEMENT: u32 = WM_APP + 3;
 
 /// Buffer length for process image paths.
 const PATH_BUF_LEN: usize = 512;
@@ -74,7 +93,7 @@ const PATH_BUF_LEN: usize = 512;
 /// click (which never reaches the hook), e.g. Shift/Ctrl-click multi-select.
 const TAP_HOLD_TIMEOUT_MS: u32 = 200;
 
-/// Window class name for the find-window hint chips.
+/// Window class name for the pick-window hint chips.
 const HINT_CLASS: PCWSTR = w!("RightKeysHint");
 
 /// System UI font family used for the hint chips.
@@ -112,6 +131,22 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 struct State {
     engine: Engine,
     watcher: ForegroundWatcher,
+    /// Active standalone hint session (triggered by the `pick-element` action).
+    hint_session: Option<HintSession>,
+    /// True while UIA enumeration for a `pick-element` action is in flight.
+    standalone_hints_pending: bool,
+}
+
+/// One element hint chip in the find-element overlay.
+struct ElementEntry {
+    overlay: HWND,
+    element: Element,
+}
+
+/// Active state of the element-hint overlay (pick-element mode).
+struct PickElement {
+    entries: Vec<ElementEntry>,
+    hints: Vec<String>,
 }
 
 /// Foreground-window watcher with a one-entry cache keyed on the window handle.
@@ -122,14 +157,14 @@ struct ForegroundWatcher {
 }
 
 /// One hint chip bound to a target window. Its hint label lives at the same
-/// index in [`FindWindow::hints`].
+/// index in [`PickWindow::hints`].
 struct HintEntry {
     overlay: HWND,
     target: HWND,
 }
 
 /// Active state of the Vimium-style window-finder overlay.
-struct FindWindow {
+struct PickWindow {
     entries: Vec<HintEntry>,
     hints: Vec<String>,
     prefix: String,
@@ -159,8 +194,10 @@ thread_local! {
     static HOOK: Cell<HHOOK> = const { Cell::new(HHOOK(std::ptr::null_mut())) };
     /// Identifier of the active tap-hold timeout timer, or `0` when none is set.
     static TAP_HOLD_TIMER: Cell<usize> = const { Cell::new(0) };
-    /// The live find-window overlay, or `None` when it is not showing.
-    static FIND_WINDOW: RefCell<Option<FindWindow>> = const { RefCell::new(None) };
+    /// The live pick-window overlay, or `None` when it is not showing.
+    static PICK_WINDOW: RefCell<Option<PickWindow>> = const { RefCell::new(None) };
+    /// The live find-element overlay (pick-element), or `None` when not showing.
+    static PICK_ELEMENT: RefCell<Option<PickElement>> = const { RefCell::new(None) };
     /// Fonts owned by the live overlay, freed when it tears down.
     static OVERLAY_FONTS: Cell<Option<OverlayFonts>> = const { Cell::new(None) };
     /// Whether the hint window class has been registered (once per process).
@@ -186,11 +223,18 @@ impl WindowWatcher for ForegroundWatcher {
 /// Install the keyboard hook and pump messages until interrupted.
 pub fn run(engine: Engine, options: Options) -> Result<()> {
     replace_or_reject(options.force)?;
+    unsafe {
+        // Opt into per-monitor DPI awareness so UIA element coordinates match
+        // what the OS actually places on screen at high DPI.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
 
     STATE.with(|state| {
         *state.borrow_mut() = Some(State {
             engine,
             watcher: ForegroundWatcher::default(),
+            hint_session: None,
+            standalone_hints_pending: false,
         });
     });
 
@@ -217,6 +261,14 @@ pub fn run(engine: Engine, options: Options) -> Result<()> {
                     send_inputs(&out);
                 }
                 clear_tap_hold_timer();
+            }
+            // UIA element enumeration finished: build the element overlay.
+            if msg.message == WM_PICK_ELEMENT {
+                let ptr = msg.wParam.0 as *mut Vec<Element>;
+                if !ptr.is_null() {
+                    let elements = unsafe { *Box::from_raw(ptr) };
+                    show_pick_element(elements);
+                }
             }
             // Dispatch so the hint-overlay windows receive WM_PAINT.
             let _ = TranslateMessage(&msg);
@@ -264,10 +316,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
     let vk = kb.vkCode as u16;
 
-    // While the find-window overlay is up, route keys to its navigator and
+    // While the pick-window overlay is up, route keys to its navigator and
     // swallow them so nothing reaches the apps underneath.
-    if FIND_WINDOW.with(|f| f.borrow().is_some()) {
-        handle_find_window_key(vk, value);
+    if PICK_WINDOW.with(|f| f.borrow().is_some()) {
+        handle_pick_window_key(vk, value);
         return LRESULT(1);
     }
 
@@ -288,6 +340,37 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return LRESULT(1);
         }
     };
+
+    // A VM/remote-viewer window owns the keyboard (e.g. a nested remapper inside
+    // the guest): let the key reach the OS unchanged, bypassing the engine so
+    // the guest receives it raw.
+    let pass_through = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut().expect("state initialized in run()");
+        let app = state.watcher.active_app();
+        state.engine.is_pass_through(&app)
+    });
+    if pass_through {
+        return call_next(code, wparam, lparam);
+    }
+
+    // Standalone hint session: intercept when pick-element is active.
+    let hint_action = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let s = state.as_mut().expect("state initialized in run()");
+        if s.standalone_hints_pending {
+            return Some(HintAction::Suppressed);
+        }
+        let hs = s.hint_session.as_mut()?;
+        if value == 0 {
+            return Some(HintAction::Suppressed); // suppress releases
+        }
+        Some(hs.process_key(key))
+    });
+    if let Some(action) = hint_action {
+        handle_hint_action(action);
+        return LRESULT(1);
+    }
 
     // Compute output with the borrow released before SendInput re-enters the hook
     // and before effects (which call into the window manager) run.
@@ -576,6 +659,27 @@ fn perform_window(hwnd: HWND, action: WindowAction) {
                     let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
                 }
             }
+            WindowAction::StepToward(corner) => {
+                if let (Some(r), Some(area)) = (window_rect(hwnd), monitor_work_area(hwnd)) {
+                    let w = r.right - r.left;
+                    let h = r.bottom - r.top;
+                    let (tx, ty) = anchor_pos(area, w, h, Some(corner));
+                    let mw = (area.right - area.left) as f64;
+                    let mh = (area.bottom - area.top) as f64;
+                    let mag = mw.hypot(mh) / STEP_DIVISOR as f64;
+                    let cx = r.left;
+                    let cy = r.top;
+                    let rdx = (tx - cx) as f64;
+                    let rdy = (ty - cy) as f64;
+                    let dist = rdx.hypot(rdy);
+                    let (nx, ny) = if dist <= mag {
+                        (tx, ty)
+                    } else {
+                        (cx + (rdx * mag / dist).round() as i32, cy + (rdy * mag / dist).round() as i32)
+                    };
+                    let _ = SetWindowPos(hwnd, None, nx, ny, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
             WindowAction::Corner(corner) => {
                 if let Some(area) = monitor_work_area(hwnd) {
                     let mw = area.right - area.left;
@@ -659,7 +763,16 @@ fn perform_window(hwnd: HWND, action: WindowAction) {
                     }
                 }
             }
-            WindowAction::FindWindow => start_find_window(),
+            WindowAction::PickWindow => start_pick_window(),
+            WindowAction::PickElement => {
+                let tid = unsafe { GetCurrentThreadId() };
+                STATE.with(|s| {
+                    if let Some(s) = s.borrow_mut().as_mut() {
+                        s.standalone_hints_pending = true;
+                    }
+                });
+                spawn_uia_enum(tid);
+            }
         }
     }
 }
@@ -668,15 +781,43 @@ fn perform_window(hwnd: HWND, action: WindowAction) {
 /// open. `program` is matched on its file stem (`brave.exe` matches a `brave`
 /// process), mirroring the old AHK "activate or launch" helper.
 fn activate_or_launch(program: &str) {
-    let stem = Path::new(program)
+    // Split shell-style so an argument can contain spaces when quoted, e.g.
+    //   exec windows="raise-or-run.bat -w \"Google - Chrome\" -c run.bat"
+    let args = match shell_words::split(program) {
+        Ok(args) => args,
+        Err(err) => {
+            crate::notify::warn(&format!("bad exec command {program:?}: {err}"));
+            return;
+        }
+    };
+    let Some((bin, rest)) = args.split_first() else {
+        return;
+    };
+    let stem = Path::new(bin)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.to_string());
+        .unwrap_or_else(|| bin.clone());
     if let Some(&hwnd) = windows_for_stem(&stem).first() {
         activate(hwnd);
     } else {
-        launch(program);
+        launch(bin, rest);
     }
+}
+
+/// Quote launch arguments for `ShellExecuteW`'s parameter string: wrap any
+/// argument containing whitespace in double quotes so `CommandLineToArgvW`
+/// re-splits it as a single argument.
+fn quote_params(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.contains(char::is_whitespace) {
+                format!("\"{arg}\"")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Launch a program by name or path. `ShellExecuteW` resolves bare names through
@@ -686,17 +827,27 @@ fn activate_or_launch(program: &str) {
 /// RightKeys is run elevated (to capture keys from elevated windows), launched
 /// apps are elevated too; launch RightKeys un-elevated, or add a shell-based
 /// de-elevation step, if that matters.
-fn launch(program: &str) {
-    let file = to_wide(program);
-    unsafe {
+fn launch(bin: &str, args: &[String]) {
+    let file = to_wide(bin);
+    let params = quote_params(args);
+    let params_wide = to_wide(&params);
+    let params_ptr = if args.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(params_wide.as_ptr())
+    };
+    let result = unsafe {
         ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(file.as_ptr()),
-            PCWSTR::null(),
+            params_ptr,
             PCWSTR::null(),
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    if result.0 as isize <= 32 {
+        crate::notify::warn(&format!("could not launch {bin:?}"));
     }
 }
 
@@ -912,9 +1063,9 @@ fn instance() -> HINSTANCE {
 }
 
 /// Build and show the Vimium-style hint overlay over every alt-tab window, and
-/// store it as the live [`FIND_WINDOW`] so the hook routes keys to it.
-fn start_find_window() {
-    if FIND_WINDOW.with(|f| f.borrow().is_some()) {
+/// store it as the live [`PICK_WINDOW`] so the hook routes keys to it.
+fn start_pick_window() {
+    if PICK_WINDOW.with(|f| f.borrow().is_some()) {
         return;
     }
     let hinst = instance();
@@ -965,8 +1116,8 @@ fn start_find_window() {
         close_fonts();
         return;
     }
-    FIND_WINDOW.with(|f| {
-        *f.borrow_mut() = Some(FindWindow {
+    PICK_WINDOW.with(|f| {
+        *f.borrow_mut() = Some(PickWindow {
             entries,
             hints: kept_hints,
             prefix: String::new(),
@@ -978,7 +1129,7 @@ fn start_find_window() {
 /// Backspace un-types, a hint character narrows or selects. On selection (or
 /// cancel) the overlay is torn down; on selection the target is activated and
 /// any modifier held to open the overlay is released.
-fn handle_find_window_key(vk: u16, value: i32) {
+fn handle_pick_window_key(vk: u16, value: i32) {
     if value != 1 {
         return; // suppress key-ups silently
     }
@@ -987,7 +1138,7 @@ fn handle_find_window_key(vk: u16, value: i32) {
         Update,
         Close(Option<HWND>),
     }
-    let act = FIND_WINDOW.with(|cell| {
+    let act = PICK_WINDOW.with(|cell| {
         let mut borrow = cell.borrow_mut();
         let Some(fw) = borrow.as_mut() else {
             return Act::Ignore;
@@ -1010,9 +1161,9 @@ fn handle_find_window_key(vk: u16, value: i32) {
     });
     match act {
         Act::Ignore => {}
-        Act::Update => update_find_window_visibility(),
+        Act::Update => update_pick_window_visibility(),
         Act::Close(target) => {
-            close_find_window();
+            close_pick_window();
             if let Some(hwnd) = target {
                 activate(hwnd);
             }
@@ -1031,8 +1182,8 @@ fn handle_find_window_key(vk: u16, value: i32) {
 }
 
 /// Show chips whose hint still matches the current prefix; hide the rest.
-fn update_find_window_visibility() {
-    FIND_WINDOW.with(|cell| {
+fn update_pick_window_visibility() {
+    PICK_WINDOW.with(|cell| {
         if let Some(fw) = cell.borrow().as_ref() {
             for (entry, hint) in fw.entries.iter().zip(fw.hints.iter()) {
                 let cmd = if hint.starts_with(&fw.prefix) {
@@ -1049,8 +1200,8 @@ fn update_find_window_visibility() {
 }
 
 /// Tear down the overlay: destroy its windows and free its fonts.
-fn close_find_window() {
-    if let Some(fw) = FIND_WINDOW.with(|cell| cell.borrow_mut().take()) {
+fn close_pick_window() {
+    if let Some(fw) = PICK_WINDOW.with(|cell| cell.borrow_mut().take()) {
         for entry in &fw.entries {
             unsafe {
                 let _ = DestroyWindow(entry.overlay);
@@ -1069,6 +1220,290 @@ fn close_fonts() {
             let _ = DeleteObject(HGDIOBJ(fonts.info.0));
         }
     }
+}
+
+// === pick-element overlay ===
+
+/// Dispatch a [`HintAction`] from the standalone hint session.
+fn handle_hint_action(action: HintAction) {
+    match action {
+        HintAction::Suppressed => {}
+        HintAction::Updated => update_pick_element_visibility(),
+        HintAction::Activate(element) => {
+            STATE.with(|s| {
+                if let Some(s) = s.borrow_mut().as_mut() {
+                    s.hint_session = None;
+                }
+            });
+            close_pick_element();
+            activate_element(element);
+        }
+        HintAction::Dismiss => {
+            STATE.with(|s| {
+                if let Some(s) = s.borrow_mut().as_mut() {
+                    s.hint_session = None;
+                }
+            });
+            close_pick_element();
+        }
+    }
+}
+
+/// Spawn a worker thread that runs UIA element enumeration and posts the results
+/// back to the message loop via [`WM_PICK_ELEMENT`].
+fn spawn_uia_enum(main_thread_id: u32) {
+    std::thread::spawn(move || {
+        let elements = uia_enumerate();
+        let ptr = Box::into_raw(Box::new(elements));
+        unsafe {
+            let _ = PostThreadMessageW(main_thread_id, WM_PICK_ELEMENT, WPARAM(ptr as usize), LPARAM(0));
+        }
+    });
+}
+
+/// Build and show the element-hint overlay from a completed enumeration result.
+fn show_pick_element(elements: Vec<Element>) {
+    let pairs = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let s = state.as_mut()?;
+        if !s.standalone_hints_pending {
+            return None;
+        }
+        s.standalone_hints_pending = false;
+        let (hs, pairs) = HintSession::new(elements, HINT_CHARS);
+        // Only enter the session when there is something to pick, so empty
+        // results don't trap input.
+        if !pairs.is_empty() {
+            s.hint_session = Some(hs);
+        }
+        Some(pairs)
+    }).unwrap_or_default();
+    if pairs.is_empty() {
+        crate::notify::info("No window elements detected");
+        return;
+    }
+    let hinst = instance();
+    register_hint_class(hinst);
+
+    let fonts = unsafe { create_fonts() };
+    OVERLAY_FONTS.with(|c| c.set(Some(fonts)));
+
+    let screen = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let dc = unsafe { GetDC(None) };
+    let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut entries: Vec<ElementEntry> = Vec::new();
+    let mut kept_hints: Vec<String> = Vec::new();
+
+    for (element, hint) in &pairs {
+        let hint_upper = hint.to_uppercase();
+        let chip = unsafe { layout_chip(dc, fonts, &hint_upper, "", "") };
+        let (px, py) = place_hint((element.x, element.y), (chip.width, chip.height), &placed, screen);
+        placed.push((px, py, chip.width, chip.height));
+        let overlay = unsafe { create_overlay_window(hinst, px, py, chip) };
+        if overlay.0.is_null() {
+            continue;
+        }
+        entries.push(ElementEntry { overlay, element: element.clone() });
+        kept_hints.push(hint.clone());
+    }
+    unsafe { ReleaseDC(None, dc) };
+
+    if entries.is_empty() {
+        close_fonts();
+        return;
+    }
+    PICK_ELEMENT.with(|f| {
+        *f.borrow_mut() = Some(PickElement { entries, hints: kept_hints });
+    });
+}
+
+/// Show only chips whose hint matches the current prefix; hide the rest.
+///
+/// Reads from the standalone hint session.
+fn update_pick_element_visibility() {
+    let matched: Vec<bool> = STATE.with(|state| {
+        state.borrow().as_ref().map(|s| {
+            s.hint_session.as_ref()
+                .map(|hs| hs.matched_hints().map(|(_, _, m)| m).collect())
+                .unwrap_or_default()
+        }).unwrap_or_default()
+    });
+    PICK_ELEMENT.with(|cell| {
+        if let Some(fe) = cell.borrow().as_ref() {
+            for (entry, &visible) in fe.entries.iter().zip(matched.iter()) {
+                let cmd = if visible { SW_SHOWNA } else { SW_HIDE };
+                unsafe {
+                    let _ = ShowWindow(entry.overlay, cmd);
+                }
+            }
+        }
+    });
+}
+
+/// Tear down the element-hint overlay windows.
+fn close_pick_element() {
+    if let Some(fe) = PICK_ELEMENT.with(|cell| cell.borrow_mut().take()) {
+        for entry in &fe.entries {
+            unsafe {
+                let _ = DestroyWindow(entry.overlay);
+            }
+        }
+    }
+    close_fonts();
+}
+
+/// Activate a selected element: move cursor to its centre and click.
+fn activate_element(element: Element) {
+    let cx = element.x + element.width / 2;
+    let cy = element.y + element.height / 2;
+    if cx < 0 || cy < 0 {
+        return;
+    }
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, INPUT_MOUSE,
+        };
+        let _ = SetCursorPos(cx, cy);
+        let click = [
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0, dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_LEFTDOWN,
+                        time: 0,
+                        dwExtraInfo: INJECT_MARKER,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0, dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_LEFTUP,
+                        time: 0,
+                        dwExtraInfo: INJECT_MARKER,
+                    },
+                },
+            },
+        ];
+        SendInput(&click, size_of::<INPUT>() as i32);
+    }
+}
+
+// === UIA element enumeration ===
+
+/// UIA control type IDs considered actionable for hint generation.
+const UIA_ACTIONABLE_TYPES: &[i32] = &[
+    UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId,
+    UIA_ComboBoxControlTypeId,
+    UIA_EditControlTypeId,
+    UIA_HeaderItemControlTypeId,
+    UIA_HyperlinkControlTypeId,
+    UIA_ListItemControlTypeId,
+    UIA_MenuItemControlTypeId,
+    UIA_RadioButtonControlTypeId,
+    UIA_SpinnerControlTypeId,
+    UIA_TabItemControlTypeId,
+    UIA_ToggleButtonControlTypeId,
+    UIA_TreeItemControlTypeId,
+];
+
+/// Enumerate interactive elements in the current foreground window via UIA.
+///
+/// Initialises COM (apartment-threaded) for this thread, enumerates, and
+/// uninitialises COM before returning.
+fn uia_enumerate() -> Vec<Element> {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let did_init = hr.is_ok();
+        let result = uia_enumerate_inner().unwrap_or_else(|e| {
+            log::warn!("UIA enumeration failed: {e}");
+            Vec::new()
+        });
+        if did_init {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+unsafe fn uia_enumerate_inner() -> anyhow::Result<Vec<Element>> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        log::debug!("no foreground window; element overlay will be empty");
+        return Ok(Vec::new());
+    }
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? };
+    let root = unsafe { automation.ElementFromHandle(hwnd)? };
+    let window_rect = unsafe { get_window_rect_opt(hwnd) };
+    let true_cond: IUIAutomationCondition = unsafe { automation.CreateTrueCondition()? };
+    let all: IUIAutomationElementArray =
+        unsafe { root.FindAll(TreeScope_Descendants, &true_cond)? };
+    let count = unsafe { all.Length()? };
+    log::debug!("UIA raw element count: {count}");
+
+    let mut elements = Vec::new();
+    for i in 0..count {
+        let elem: IUIAutomationElement = unsafe { all.GetElement(i)? };
+        if let Some(e) = unsafe { uia_element_to_element(&elem, window_rect) } {
+            elements.push(e);
+        }
+    }
+    log::debug!("UIA actionable elements found: {}", elements.len());
+    Ok(elements)
+}
+
+unsafe fn uia_element_to_element(
+    elem: &IUIAutomationElement,
+    window_rect: Option<RECT>,
+) -> Option<Element> {
+    use windows::Win32::Foundation::BOOL;
+    let ctrl_type = unsafe { elem.get_CurrentControlType().ok()? };
+    if !UIA_ACTIONABLE_TYPES.contains(&ctrl_type) {
+        return None;
+    }
+    let enabled: BOOL = unsafe { elem.get_CurrentIsEnabled().ok()? };
+    if !enabled.as_bool() {
+        return None;
+    }
+    let offscreen: BOOL = unsafe { elem.get_CurrentIsOffscreen().ok()? };
+    if offscreen.as_bool() {
+        return None;
+    }
+    let rect: RECT = unsafe { elem.get_CurrentBoundingRectangle().ok()? };
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    if w <= 0 || h <= 0 || rect.left < 0 || rect.top < 0 {
+        return None;
+    }
+    if let Some(wr) = window_rect {
+        if !rects_intersect_elem(rect, wr) {
+            return None;
+        }
+    }
+    let name = unsafe {
+        elem.get_CurrentName()
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    };
+    Some(Element { height: h, label: name, width: w, x: rect.left, y: rect.top })
+}
+
+unsafe fn get_window_rect_opt(hwnd: HWND) -> Option<RECT> {
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r).ok()? };
+    Some(r)
+}
+
+fn rects_intersect_elem(a: RECT, b: RECT) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
 }
 
 /// [`EnumWindows`] callback: collect alt-tab-able top-level windows.

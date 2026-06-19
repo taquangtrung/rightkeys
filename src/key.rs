@@ -279,6 +279,29 @@ define_keys! {
 }
 
 impl Key {
+    /// Whether this key is one of the function keys F1–F12. A real modifier
+    /// paired with a function key (e.g. `M+f4` to close a window) is a
+    /// window-manager shortcut rather than a repeatable key, so the engine
+    /// emits such chords one-shot — holding them would leave the modifier
+    /// reported as down while the shortcut's dialog runs.
+    pub fn is_function_key(self) -> bool {
+        matches!(
+            self,
+            Key::F1
+                | Key::F2
+                | Key::F3
+                | Key::F4
+                | Key::F5
+                | Key::F6
+                | Key::F7
+                | Key::F8
+                | Key::F9
+                | Key::F10
+                | Key::F11
+                | Key::F12
+        )
+    }
+
     /// Build a key from a raw Linux `evdev` code, or `None` if unknown.
     /// Code `0` (the synthetic `Hyper` placeholder) never matches.
     #[cfg(target_os = "linux")]

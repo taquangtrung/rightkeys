@@ -32,8 +32,42 @@ pub fn load(path: &Path) -> Result<Config> {
         fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
     let doc: KdlDocument = text
         .parse()
-        .map_err(|e: kdl::KdlError| anyhow!("parsing {}:\n{e}", path.display()))?;
+        .map_err(|e: kdl::KdlError| format_parse_error(path, &e))?;
     lower(&doc)
+}
+
+fn format_parse_error(path: &Path, e: &kdl::KdlError) -> anyhow::Error {
+    let mut msg = format!("parsing {}:", path.display());
+    for diag in &e.diagnostics {
+        let (line, col) = byte_offset_to_line_col(&e.input, diag.span.offset());
+        msg.push_str(&format!("\n  line {line}, col {col}: {diag}"));
+        if let Some(help) = &diag.help {
+            msg.push_str(&format!("\n  help: {help}"));
+        }
+        if let Some(line_text) = e.input.lines().nth(line.saturating_sub(1)) {
+            msg.push_str(&format!("\n    {line_text}"));
+            msg.push_str(&format!("\n    {}^", " ".repeat(col.saturating_sub(1))));
+        }
+    }
+    anyhow!("{msg}")
+}
+
+fn byte_offset_to_line_col(text: &str, byte_offset: usize) -> (usize, usize) {
+    let (mut line, mut col) = (1usize, 1usize);
+    let mut pos = 0usize;
+    for c in text.chars() {
+        if pos >= byte_offset {
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        pos += c.len_utf8();
+    }
+    (line, col)
 }
 
 fn lower(doc: &KdlDocument) -> Result<Config> {
@@ -47,6 +81,31 @@ fn lower(doc: &KdlDocument) -> Result<Config> {
             "modmap" => lower_modmap(node, &mut config)?,
             "multipurpose-modmap" => config.multipurpose.push(lower_multipurpose(node)?),
             "keymap" => config.keymaps.push(lower_keymap(node)?),
+            "pass-through" => {
+                for arg in node.entries() {
+                    if let Some(s) = arg.value().as_string() {
+                        config.pass_through.push(s.to_owned());
+                    }
+                }
+            }
+            "pass-through-linux" => {
+                if cfg!(target_os = "linux") {
+                    for arg in node.entries() {
+                        if let Some(s) = arg.value().as_string() {
+                            config.pass_through.push(s.to_owned());
+                        }
+                    }
+                }
+            }
+            "pass-through-windows" => {
+                if cfg!(windows) {
+                    for arg in node.entries() {
+                        if let Some(s) = arg.value().as_string() {
+                            config.pass_through.push(s.to_owned());
+                        }
+                    }
+                }
+            }
             other => bail!("unknown top-level node {other:?}"),
         }
     }
@@ -201,13 +260,15 @@ fn lower_window_action(node: &KdlNode) -> Result<WindowAction> {
         },
         "center" => WindowAction::Center,
         "snap" => WindowAction::Snap(parse_corner(prop_required(node, "to")?)?),
+        "step-toward" => WindowAction::StepToward(parse_corner(prop_required(node, "to")?)?),
         "corner" => WindowAction::Corner(parse_corner(prop_required(node, "to")?)?),
         "smart-tile" => WindowAction::SmartTile {
             side: parse_side(prop_required(node, "to")?)?,
             // Placeholder; the engine fills the real fraction from the tile cycle.
             fraction: 0.5,
         },
-        "find-window" => WindowAction::FindWindow,
+        "pick-window" => WindowAction::PickWindow,
+        "pick-element" => WindowAction::PickElement,
         "maximize" => WindowAction::Maximize,
         "maximize-toggle" => WindowAction::MaximizeToggle,
         "minimize" => WindowAction::Minimize,
@@ -479,12 +540,78 @@ mod tests {
     }
 
     #[test]
-    fn parses_find_window_action() {
-        let config = lower_str(r#"keymap { bind "Hyper+f" { wm action="find-window"; } }"#).unwrap();
+    fn exec_preserves_quoted_arg_for_shell_split() {
+        // An exec argument with spaces is quoted (single quotes inside the KDL
+        // string). The quotes must survive lowering so the backend's shell-style
+        // split keeps the spaced value as a single argument.
+        let config = lower_str(
+            r#"keymap { bind "s+g" { exec linux="raise-or-run.sh -w 'Brave-browser:Google Scholar' -c run.sh"; } }"#,
+        )
+        .unwrap();
+        let exec = config.keymaps[0]
+            .bindings
+            .get(&Combo::parse("s+g").unwrap())
+            .unwrap();
+        let Step::Exec(program) = &exec[0] else {
+            panic!("expected an exec step");
+        };
+        assert_eq!(
+            shell_words::split(program).unwrap(),
+            vec![
+                "raise-or-run.sh",
+                "-w",
+                "Brave-browser:Google Scholar",
+                "-c",
+                "run.sh",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_raw_string_keeps_inner_double_quotes_for_shell_split() {
+        // A KDL raw string (#"..."#) lets the spaced argument use double quotes
+        // without escaping; those quotes must reach the shell-style split intact.
+        let config = lower_str(
+            "keymap { bind \"s+g\" { exec linux=#\"raise-or-run.sh -w \"Brave-browser:Google Scholar\" -c run.sh\"#; } }",
+        )
+        .unwrap();
+        let exec = config.keymaps[0]
+            .bindings
+            .get(&Combo::parse("s+g").unwrap())
+            .unwrap();
+        let Step::Exec(program) = &exec[0] else {
+            panic!("expected an exec step");
+        };
+        assert_eq!(
+            shell_words::split(program).unwrap(),
+            vec![
+                "raise-or-run.sh",
+                "-w",
+                "Brave-browser:Google Scholar",
+                "-c",
+                "run.sh",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_pick_window_action() {
+        let config = lower_str(r#"keymap { bind "Hyper+f" { wm action="pick-window"; } }"#).unwrap();
         let b = &config.keymaps[0].bindings;
         assert!(matches!(
             b.get(&Combo::parse("Hyper+f").unwrap()).unwrap().as_slice(),
-            [Step::Window(WindowAction::FindWindow)]
+            [Step::Window(WindowAction::PickWindow)]
+        ));
+    }
+
+    #[test]
+    fn parses_pick_element_action() {
+        let config =
+            lower_str(r#"keymap { bind "Hyper+h" { wm action="pick-element"; } }"#).unwrap();
+        let b = &config.keymaps[0].bindings;
+        assert!(matches!(
+            b.get(&Combo::parse("Hyper+h").unwrap()).unwrap().as_slice(),
+            [Step::Window(WindowAction::PickElement)]
         ));
     }
 

@@ -93,6 +93,9 @@ pub enum WindowAction {
     Center,
     /// Move the window to a corner of its monitor, keeping its current size.
     Snap(Corner),
+    /// Move the window one step toward a corner (by [`STEP_X`] x [`STEP_Y`] pixels),
+    /// keeping its current size. Repeating nudges it gradually; `Snap` teleports it.
+    StepToward(Corner),
     /// Tile the window to a quarter of its monitor work area.
     Corner(Corner),
     /// Tile the window to a screen edge at `fraction` of the work area. The
@@ -110,7 +113,10 @@ pub enum WindowAction {
     /// Toggle showing the desktop (minimize/restore all windows).
     ShowDesktop,
     /// Show a Vimium-style hint overlay to choose and focus any desktop window.
-    FindWindow,
+    PickWindow,
+    /// Show an element-hint overlay over the active window; clicking a hint
+    /// activates that UI element.
+    PickElement,
     /// Move the window to the next/previous monitor, keeping its relative place.
     MoveToMonitor(CycleDirection),
     /// Activate the next/previous window of the same application.
@@ -179,6 +185,9 @@ pub struct Config {
     pub modmap: HashMap<Key, Key>,
     pub multipurpose: Vec<MultipurposeRule>,
     pub keymaps: Vec<KeymapRule>,
+    /// Apps that bypass all remapping: keys are forwarded raw. Case-insensitive
+    /// substring match against WM_CLASS (Linux) or process name (Windows).
+    pub pass_through: Vec<String>,
 }
 
 /// A multipurpose key awaiting its tap-vs-hold decision.
@@ -194,12 +203,57 @@ struct Pending {
 #[derive(Clone, Debug)]
 struct HeldChord {
     target: Key,
-    saved: BTreeSet<Modifier>,
+    /// Modifier state to restore when the key lifts: the physically-held real
+    /// modifiers at press time, *not* a snapshot of the emitted output (which
+    /// can include another overlapping chord's modifiers and would otherwise be
+    /// resurrected here, leaving e.g. Alt stuck on after release).
+    resting: BTreeSet<Modifier>,
 }
 
 /// Smart-tile sizes, cycled in order on consecutive same-edge tiles: a half,
 /// then a third, then two-thirds. A broken chain restarts at index 0.
 const TILE_FRACTIONS: [f64; 3] = [0.5, 1.0 / 3.0, 2.0 / 3.0];
+
+/// Divides the monitor diagonal to produce the Euclidean step magnitude for
+/// [`WindowAction::StepToward`]. Each press moves the window exactly
+/// `diagonal / STEP_DIVISOR` pixels toward the corner; at 1920x1080 that is
+/// ~73 px (≈ 30 presses to cross the full diagonal).
+pub const STEP_DIVISOR: i32 = 30;
+
+/// Window identifiers that capture the keyboard for a guest or remote session,
+/// so all keys must reach them raw (a nested remapper inside the guest does its
+/// own mapping). Matched case-insensitively as substrings of the active window,
+/// in addition to any user-listed `pass-through` entries, so focusing a VM
+/// "just works" without per-machine config.
+///
+/// The set differs per OS because the match target differs: on Linux it is the
+/// X11 `WM_CLASS`; on Windows it is the focused window's process-name stem. The
+/// macOS set is added when that platform is supported.
+#[cfg(target_os = "linux")]
+const DEFAULT_PASS_THROUGH_CLASSES: &[&str] = &[
+    "gnome-boxes",
+    "looking-glass",
+    "qemu",
+    "remote-viewer",
+    "spicy",
+    "virt-manager",
+    "virt-viewer",
+    "virtualbox",
+    "vmware",
+];
+
+#[cfg(windows)]
+const DEFAULT_PASS_THROUGH_CLASSES: &[&str] = &[
+    "qemu",
+    "remote-viewer",
+    "virt-viewer",
+    "virtualbox", // covers VirtualBoxVM
+    "vmconnect",  // Hyper-V guest console
+    "vmware",     // covers vmware-vmx
+];
+
+#[cfg(not(any(target_os = "linux", windows)))]
+const DEFAULT_PASS_THROUGH_CLASSES: &[&str] = &[];
 
 /// The stateful remapping engine.
 #[derive(Debug)]
@@ -258,6 +312,23 @@ impl Engine {
             tile_chain: None,
             effects: Vec::new(),
         }
+    }
+
+    /// Whether all keys should be forwarded raw for the given app, bypassing
+    /// the remapping engine. Case-insensitive substring match against `app`
+    /// (WM_CLASS on Linux, process name on Windows), against both the built-in
+    /// VM/remote classes and any user-listed `pass-through` entries, so a
+    /// focused guest receives keys first with no config.
+    pub fn is_pass_through(&self, app: &str) -> bool {
+        let lower = app.to_ascii_lowercase();
+        DEFAULT_PASS_THROUGH_CLASSES
+            .iter()
+            .any(|p| lower.contains(p))
+            || self
+                .config
+                .pass_through
+                .iter()
+                .any(|p| lower.contains(p.to_ascii_lowercase().as_str()))
     }
 
     /// Drain the side effects accumulated since the last call. The backend calls
@@ -336,7 +407,7 @@ impl Engine {
                     key: chord.target,
                     value: 0,
                 });
-                self.sync_mods(&chord.saved, &mut out);
+                self.sync_mods(&chord.resting, &mut out);
             } else if self.passthrough_down.remove(&key) {
                 out.push(OutEvent { key, value: 0 });
             } else {
@@ -384,9 +455,10 @@ impl Engine {
 
     /// Handle the initial press of a bound key. A single combo is held down so it
     /// repeats naturally; multi-step sequences, mark toggles, and pass-through are
-    /// one-shots. The exception is a single combo whose target carries `Super`: it
-    /// drives a window-manager shortcut, so it is emitted one-shot to avoid
-    /// leaving modifiers down while the shortcut runs.
+    /// one-shots. The exception is a single combo whose target is a window-manager
+    /// shortcut chord (carries `Super`, or pairs a real modifier with a function
+    /// key such as `M+f4`): it is emitted one-shot to avoid leaving modifiers
+    /// down while the shortcut runs.
     fn press_binding(
         &mut self,
         phys: Key,
@@ -411,11 +483,15 @@ impl Engine {
         if let Some((target, mark_aware)) = single {
             self.tile_chain = None; // a key remap breaks the smart-tile chain
             let add_shift = mark_aware && self.mark_set;
-            if target.modifiers.contains(&Modifier::Super) {
+            if is_one_shot_chord(target) {
                 self.emit_combo(target, add_shift, out);
                 return;
             }
-            let saved = self.output_mods.clone();
+            // Restore to the physically-held real modifiers on release, not the
+            // current output: with overlapping held chords the output can carry
+            // another chord's modifier (e.g. Alt), and snapshotting it here would
+            // re-press that modifier on release and leave it stuck on.
+            let resting = real_only(&self.pressed_mods);
             let mut desired = real_only(&target.modifiers);
             if add_shift {
                 desired.insert(Modifier::Shift);
@@ -429,7 +505,7 @@ impl Engine {
                 phys,
                 HeldChord {
                     target: target.key,
-                    saved,
+                    resting,
                 },
             );
         } else {
@@ -447,11 +523,34 @@ impl Engine {
         out
     }
 
+    /// Track a key the backend forwarded raw (bypassing remapping) while another
+    /// client held a keyboard grab or the focused app is pass-through, so the
+    /// engine's modifier bookkeeping stays accurate. Without this, a modifier
+    /// released during a grab is never removed from the pressed set and bleeds
+    /// into every later remap (e.g. Alt left "stuck on" after `Super+Alt+key`
+    /// focuses a grabbing VM). Repeats carry no state change. The raw forward
+    /// already moved the OS, so the emitted set is realigned to match.
+    pub fn track_passthrough(&mut self, raw: Key, value: i32) {
+        if value == 2 {
+            return;
+        }
+        let key = self.config.modmap.get(&raw).copied().unwrap_or(raw);
+        let Some(modifier) = key.as_modifier() else {
+            return;
+        };
+        if value == 0 {
+            self.pressed_mods.remove(&modifier);
+        } else {
+            self.pressed_mods.insert(modifier);
+        }
+        self.output_mods = real_only(&self.pressed_mods);
+    }
+
     /// Release every modifier currently held, both at the OS output and in the
     /// engine's tracked physical set, returning the events to emit. The backend
-    /// calls this when an input-capturing overlay (find-window) is dismissed:
-    /// while the overlay is up, key presses route to it rather than the engine,
-    /// so a modifier held to open it (e.g. `Super+f`) would otherwise stay stuck
+    /// calls this when an input-capturing overlay (pick-window, pick-element) is
+    /// dismissed: while the overlay is up, key presses route to it rather than
+    /// the engine, so a modifier held to open it would otherwise stay stuck
     /// down. Clearing the physical set too keeps a still-held modifier from being
     /// re-pressed by the next keystroke and makes its eventual release a no-op.
     pub fn clear_modifiers(&mut self) -> Vec<OutEvent> {
@@ -537,7 +636,11 @@ impl Engine {
                     self.emit_combo(&combo, false, out);
                 }
                 // Side effects emit no key events; the backend performs them
-                // after draining `take_effects`.
+                // after draining `take_effects`. Held modifiers are left intact
+                // so a modifier held across several combos (leader-key style)
+                // keeps working; their eventual physical release is handled
+                // normally, and the reader staying alive (EINTR is retried) plus
+                // pass-through tracking keep them from ever sticking.
                 Step::Exec(program) => self.effects.push(Effect::Launch(program.clone())),
                 // Smart-tile advances the cycle when the previous action tiled
                 // the same edge, else restarts at a half; the engine fills in the
@@ -609,6 +712,19 @@ fn real_only(mods: &BTreeSet<Modifier>) -> BTreeSet<Modifier> {
         .copied()
         .filter(|m| m.emit_key().is_some())
         .collect()
+}
+
+/// Whether a single-combo binding's target should be emitted one-shot (pressed
+/// and released immediately) instead of held down for auto-repeat. True for
+/// window-manager shortcut chords: any chord carrying `Super`, and any chord
+/// pairing a real modifier with a function key (e.g. `M+f4` to close a window).
+/// Holding such a chord leaves its modifier reported as down while the shortcut
+/// runs — for `M+f4` that means Alt stays held through the close-confirm dialog,
+/// so clicks land as Alt+click (a window drag on most WMs) and keys land as
+/// Alt+key, making the dialog appear frozen.
+fn is_one_shot_chord(target: &Combo) -> bool {
+    target.modifiers.contains(&Modifier::Super)
+        || (!real_only(&target.modifiers).is_empty() && target.key.is_function_key())
 }
 
 // Tests
@@ -884,9 +1000,10 @@ mod tests {
 
     #[test]
     fn clear_modifiers_releases_held_and_forgets_them() {
-        // A modifier held to open the find-window overlay must be released when
-        // the overlay is dismissed, and forgotten so it is neither re-pressed by
-        // the next key nor double-released when the physical key comes up.
+        // A modifier held to open an overlay (pick-window, pick-element) must be
+        // released when the overlay is dismissed, and forgotten so it is neither
+        // re-pressed by the next key nor double-released when the physical key
+        // comes up.
         let mut engine = Engine::new(Config::default());
         assert_eq!(
             engine.on_event(Key::LeftAlt, 1, ""),
@@ -896,6 +1013,53 @@ mod tests {
         // Already cleared: a second call and the eventual physical release are no-ops.
         assert!(engine.clear_modifiers().is_empty());
         assert!(engine.on_event(Key::LeftAlt, 0, "").is_empty());
+    }
+
+    #[test]
+    fn passthrough_release_clears_stuck_modifier() {
+        // Super+Alt+key focuses a grabbing client (e.g. a VM): the key and the
+        // modifier releases are forwarded raw. Tracking them keeps the engine's
+        // modifier set accurate so Alt is not left "stuck on" afterwards.
+        let mut engine = Engine::new(Config::default());
+        // Both modifiers are forwarded eagerly on their presses.
+        assert_eq!(engine.on_event(Key::LeftMeta, 1, ""), vec![press(Key::LeftMeta)]);
+        assert_eq!(engine.on_event(Key::LeftAlt, 1, ""), vec![press(Key::LeftAlt)]);
+        // Grab is now active: the key press and both modifier releases bypass
+        // remapping and are forwarded raw.
+        engine.track_passthrough(Key::J, 1);
+        engine.track_passthrough(Key::J, 0);
+        engine.track_passthrough(Key::LeftAlt, 0);
+        engine.track_passthrough(Key::LeftMeta, 0);
+        // Back to normal: a plain letter types itself with no leftover modifiers.
+        assert_eq!(engine.on_event(Key::A, 1, ""), vec![press(Key::A)]);
+    }
+
+    #[test]
+    fn overlapping_hyper_chords_do_not_stick_a_modifier() {
+        // Two held Hyper combos that each carry Alt (word-wise nav). Releasing
+        // them out of order must not leave Alt pressed once everything is up.
+        let config = Config {
+            modmap: HashMap::from([(Key::CapsLock, Key::LeftHyper)]),
+            keymaps: vec![keymap(
+                "global",
+                AppMatcher::default(),
+                vec![
+                    ("Hyper+h", vec![Step::Keys(Combo::parse("M+left").unwrap())]),
+                    ("Hyper+l", vec![Step::Keys(Combo::parse("M+right").unwrap())]),
+                ],
+            )],
+            ..Config::default()
+        };
+        let mut engine = Engine::new(config);
+        engine.on_event(Key::CapsLock, 1, ""); // Hyper down
+        engine.on_event(Key::H, 1, ""); // Alt+Left, held
+        engine.on_event(Key::L, 1, ""); // Alt+Right, held
+        engine.on_event(Key::CapsLock, 0, ""); // Hyper up first
+        engine.on_event(Key::H, 0, "");
+        engine.on_event(Key::L, 0, "");
+        // Everything is physically up: a plain letter must type cleanly, with no
+        // leftover Alt resurrected by a stale held-chord snapshot.
+        assert_eq!(engine.on_event(Key::A, 1, ""), vec![press(Key::A)]);
     }
 
     #[test]
@@ -980,6 +1144,38 @@ mod tests {
             ]
         );
         assert!(engine.on_event(Key::H, 0, "").is_empty());
+    }
+
+    #[test]
+    fn modifier_function_key_emits_one_shot() {
+        // A real modifier paired with a function key (e.g. M+f4 to close a
+        // window) is a window-manager shortcut, so it is emitted one-shot on the
+        // trigger press — not held down. Holding it would leave Alt reported as
+        // down while the WM shows its close-confirm dialog, so clicks land as
+        // Alt+click (a window drag) and the dialog appears frozen. The trigger
+        // release emits nothing; Alt is lifted by its own physical release.
+        let config = Config {
+            keymaps: vec![keymap(
+                "global",
+                AppMatcher::default(),
+                vec![("M+q", vec![Step::Keys(Combo::parse("M+f4").unwrap())])],
+            )],
+            ..Config::default()
+        };
+        let mut engine = Engine::new(config);
+        assert_eq!(
+            engine.on_event(Key::LeftAlt, 1, ""),
+            vec![press(Key::LeftAlt)]
+        );
+        assert_eq!(
+            engine.on_event(Key::Q, 1, ""),
+            vec![press(Key::F4), release(Key::F4)]
+        );
+        assert!(engine.on_event(Key::Q, 0, "").is_empty());
+        assert_eq!(
+            engine.on_event(Key::LeftAlt, 0, ""),
+            vec![release(Key::LeftAlt)]
+        );
     }
 
     #[test]
@@ -1110,6 +1306,33 @@ mod tests {
     }
 
     #[test]
+    fn exec_keeps_held_modifier_for_chained_combos() {
+        // Holding a modifier and firing several combos (leader-key style) must
+        // keep the modifier live: launching an app must not wipe it, or the next
+        // combo under the same hold would be seen without the modifier and fail.
+        let config = Config {
+            keymaps: vec![keymap(
+                "global",
+                AppMatcher::default(),
+                vec![
+                    ("s+g", vec![Step::Exec("app".to_string())]),
+                    ("s+l", vec![Step::Keys(Combo::parse("down").unwrap())]),
+                ],
+            )],
+            ..Config::default()
+        };
+        let mut engine = Engine::new(config);
+        engine.on_event(Key::LeftMeta, 1, ""); // Super down, kept held
+        engine.on_event(Key::G, 1, ""); // exec: queues launch, leaves Super intact
+        engine.on_event(Key::G, 0, "");
+        assert_eq!(engine.take_effects(), vec![Effect::Launch("app".to_string())]);
+        // Still holding Super: s+l resolves as Super+l (-> Down), proving the
+        // launch did not drop the held modifier.
+        let out = engine.on_event(Key::L, 1, "");
+        assert!(out.contains(&press(Key::Down)), "got {out:?}");
+    }
+
+    #[test]
     fn window_step_records_window_effect() {
         let config = Config {
             keymaps: vec![keymap(
@@ -1167,5 +1390,26 @@ mod tests {
         assert_eq!(CycleDirection::Forward.step(2, 3), 0);
         assert_eq!(CycleDirection::Backward.step(2, 3), 1);
         assert_eq!(CycleDirection::Backward.step(0, 3), 2);
+    }
+
+    #[test]
+    fn pass_through_matches_builtin_vm_classes_and_config() {
+        // Built-in VM identifiers match with no config, case-insensitively, so a
+        // focused guest receives keys raw out of the box. `qemu` and `virtualbox`
+        // are in every platform's set, keeping this test OS-agnostic.
+        let engine = Engine::new(Config::default());
+        assert!(engine.is_pass_through("qemu-system-x86_64"));
+        assert!(engine.is_pass_through("VirtualBoxVM"));
+        assert!(!engine.is_pass_through("Alacritty"));
+        assert!(!engine.is_pass_through(""));
+
+        // A user-listed class extends the built-in set.
+        let config = Config {
+            pass_through: vec!["Remmina".to_string()],
+            ..Config::default()
+        };
+        let engine = Engine::new(config);
+        assert!(engine.is_pass_through("org.remmina.Remmina"));
+        assert!(engine.is_pass_through("qemu")); // built-ins still apply
     }
 }

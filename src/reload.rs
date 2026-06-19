@@ -78,7 +78,7 @@ fn publish(path: &Path) {
         }
         Err(error) => {
             log::warn!("config reload failed, keeping current config: {error:#}");
-            crate::notify::warn("Invalid config, keeping current settings");
+            crate::notify::warn(&format!("Invalid config: {error:#}"));
         }
     }
 }

@@ -2,272 +2,174 @@
 
 *Using the right keys, everywhere you want.*
 
-A cross-platform key remapper for Linux (X11) and Windows. Remap keys globally
-or per application, manage windows, and launch apps, all from one config file:
+A cross-platform key remapper for Linux (X11) and Windows. Configure keymaps,
+window management, and app launching in one KDL file that works on both OSes.
 
-- **Modmaps** for global single-key remaps.
-- **Multi-step actions** that emit several combos in sequence.
-- **A selection** for shift-select style bindings.
-- **Tap-hold** keys: tap for one key, hold for a modifier.
-- **Window management**, native on each OS: move, resize, smart-tile (cycling
-  ½ / ⅓ / ⅔), presets, corners, center, maximize, minimize, always-on-top,
-  move to the next monitor, cycle same-app windows, and virtual-desktop
-  switching.
-- **App launching** that raises a running window of the app, or starts it.
-- **One config for both OSes**: any step (`keys`, `exec`, ...) can carry per-OS
-  targets (`windows=` / `linux=` / `macos=`), so a single binding works on each.
+**Features:** modmaps, tap-hold keys, multi-step bindings, selection-aware
+remaps, window management (move, resize, tile, snap, maximize, workspaces,
+monitors), app launching, and a hint-based element/window picker.
 
 ## Install
-
-From crates.io (install the dependencies below first):
 
 ```sh
 cargo install rightkeys
 ```
 
-Dependencies (Linux only; Windows needs none):
+Linux build dependencies: `libgtk-3-dev` (Debian/Ubuntu) or `gtk3-devel`
+(Fedora). Runtime: an Ayatana AppIndicator host for the tray icon.
 
-- **Build:** GTK 3 headers, `libgtk-3-dev` (Debian/Ubuntu) or `gtk3-devel` (Fedora).
-- **Run:** an Ayatana AppIndicator host (`libayatana-appindicator3-1`), for the tray icon. Most desktops provide it; GNOME needs the AppIndicator extension.
-
-Build only:
-
-```sh
-cargo build --release      # binary at target/release/rightkeys
-```
-
-Or install system-wide with the application icon and a menu launcher. Build as
-your user first (cargo is not on root's `PATH`), then install as root:
+Or build from source:
 
 ```sh
 make build
-sudo make install          # binary, icons, and a Start-menu (.desktop) entry
-make install-config        # copy the example config to ~/.config/rightkeys/config.kdl
+sudo make install        # binary + icons + .desktop entry
+make install-config      # copy example config to ~/.config/rightkeys/settings.kdl
 ```
-
-Install for the current user only (no root; `~/.local/bin` must be on `PATH`):
-
-```sh
-make build
-make install PREFIX=$HOME/.local
-```
-
-Other Make targets:
-
-- `make icons` regenerates the icon set from `assets/icons/rightkeys.svg`.
-- `sudo make uninstall` removes everything.
 
 ## Run
 
 ### Linux
 
-Linux needs access to your input devices. The quickest way is `sudo`:
-
 ```sh
-rightkeys --list-devices                        # see your keyboards
-sudo rightkeys --config ./config.example.kdl    # run
-sudo rightkeys --config ./config.example.kdl -d # run with debug output
+sudo rightkeys                    # uses ~/.config/rightkeys/settings.kdl
+sudo rightkeys --config my.kdl -d # custom config, debug output
 ```
 
-**Without `sudo`:** grant a dedicated group access to the input devices, then
-run as your normal user:
+For passwordless use, grant a group access to input devices:
 
 ```sh
-# 1. Create a group and add yourself to it
-sudo groupadd -f keymapper
-sudo gpasswd -a $USER keymapper
-
-# 2. Let that group read keyboards and write the virtual device
+sudo groupadd -f keymapper && sudo gpasswd -a $USER keymapper
 cat <<EOF | sudo tee /etc/udev/rules.d/70-keymapper.rules
 KERNEL=="uinput", GROUP="keymapper", MODE="0660", OPTIONS+="static_node=uinput"
 KERNEL=="event[0-9]*", GROUP="keymapper", MODE="0660"
 EOF
-
-# 3. Reboot, then run without sudo
-rightkeys --config ./config.example.kdl
+# reboot, then run without sudo
 ```
-
-> **Default config** (when `--config` is omitted): `~/.config/rightkeys/config.kdl`
-> (or `$XDG_CONFIG_HOME/rightkeys/config.kdl`).
 
 ### Windows
 
-> **Note:** virtual-desktop actions (`workspace` / `move-to-workspace`) use the
-> Windows 11 virtual-desktop COM API and require **Windows 11 ≥ 24H2**.
-
-Run from an elevated prompt to remap inside elevated windows:
-
 ```powershell
-rightkeys.exe --config %APPDATA%\rightkeys\config.kdl
+rightkeys.exe    # uses %APPDATA%\rightkeys\settings.kdl
 ```
 
-> **Default config** (when `--config` is omitted): `%APPDATA%\rightkeys\config.kdl`.
+Virtual-desktop actions require Windows 11 ≥ 24H2.
 
 ### Flags
 
 | Flag | Meaning |
 |---|---|
-| `--config <file>` | Config file to load. |
-| `--device <path or name>` | Grab a specific keyboard (repeatable). Auto-detects if unset. |
-| `--list-devices` | List keyboards and exit (Linux). |
-| `-f`, `--force` | Replace an already-running instance (otherwise RightKeys refuses to start a second one). |
-| `-d`, `--debug` | Print each key and its translation. |
+| `--config <file>` | Config file to load |
+| `--device <path>` | Grab a specific keyboard (repeatable; auto-detects if unset) |
+| `--list-devices` | List keyboards and exit (Linux) |
+| `-f`, `--force` | Replace an already-running instance |
+| `-d`, `--debug` | Print each key and its translation |
 
-### System tray
-
-RightKeys shows a tray icon (Linux and Windows) with a menu to toggle remapping,
-reload the config, or quit. If the tray can't be created, it keeps running
-without it.
+The tray icon (Linux and Windows) lets you toggle remapping, reload config, or quit.
 
 ## Configuration
 
-See [`config.example.kdl`](config.example.kdl) for a worked example.
+See [`config.example.kdl`](config.example.kdl) for a full example. Config edits
+reload automatically; an invalid file is rejected and the previous config kept.
 
-### Nodes
+### Top-level nodes
 
-| Node | Properties | Purpose |
-|---|---|---|
-| `settings` | `timeout` | Global settings (`timeout` is reserved; currently unused). |
-| `modmap` | (none) | Container for global single-key remaps. |
-| `map` (in `modmap`) | `from`, `to` | Remap a physical key globally (e.g. `capslock` to `left_hyper`). |
-| `multipurpose-modmap` | `application`, `application-not` | Container for tap-hold keys. |
-| `map` (in `multipurpose-modmap`) | `key`, `tap`, `hold` | Tap `key` to send `tap`; hold it to act as the `hold` modifier. |
-| `keymap` | `name`, `application`, `application-not` | A set of `bind` bindings scoped to matching apps. |
-| `bind` (in `keymap`) | argument = trigger combo; a block of step nodes | One binding (see below). |
+| Node | Purpose |
+|---|---|
+| `modmap` | Global single-key remaps (`map from="capslock" to="left_hyper"`) |
+| `multipurpose-modmap` | Tap-hold keys (`map key="left_alt" tap="esc" hold="left_alt"`) |
+| `keymap` | A set of bindings, optionally scoped to apps via `application=` / `application-not=` (regex) |
+| `settings` | Global settings (`timeout` reserved for future tap-hold timing) |
 
-`application` / `application-not` are regular expressions matched against the
-active window's identifier.
+### Bindings
 
-One config file serves every platform: window management is performed natively on
-each OS, and steps like `keys` and `exec` can take per-OS targets (see below).
-
-### Bind forms
-
-Inside a `keymap`, each `bind` takes the trigger combo as its argument and a
-block of one or more step nodes (there is no `to=`/`mark-to=` shorthand, one
-form only):
+Each `bind` in a `keymap` takes a trigger combo and a block of step nodes:
 
 ```kdl
-bind "M+c" { keys "C+c"; }                  // emit a combo
-bind "C+a" { keys "home" extend="selection"; }  // adds Shift while a selection is active
-bind "C+k" { keys "S+end"; keys "C+x"; selection "clear"; }  // multiple steps, run in order
-bind "C+q" { pass-through; }                // let the original key through
+bind "M+c"  { keys "C+c"; }
+bind "C+a"  { keys "home" extend="selection"; }   // adds Shift while a selection is active
+bind "C+k"  { keys "S+end"; keys "C+x"; selection "clear"; }
+bind "C+q"  { pass-through; }
 ```
 
-Step nodes (inside a `bind { ... }` block):
+Step nodes:
 
 | Step | Meaning |
 |---|---|
-| `keys "<combo>"` | Emit a combo. Accepts per-OS targets, see below. |
-| `keys "<combo>" extend="selection"` | Emit a combo, adding `Shift` while a selection is active. Accepts per-OS targets. |
-| `selection "start"` | Start a selection (anchor here; subsequent `extend` keys grow it). |
-| `selection "clear"` | Clear the selection. |
-| `pass-through` | Emit the original trigger key unchanged. |
-| `exec "<name\|path>"` | Activate an existing window of the program, or launch it. Accepts per-OS targets, see below. |
-| `wm action="<...>" ...` | Act on the foreground window, native on both OSes (see below). |
+| `keys "<combo>"` | Emit a combo |
+| `keys "<combo>" extend="selection"` | Emit a combo, adding Shift while a selection is active |
+| `selection "start"` / `"clear"` | Start or clear a selection anchor |
+| `pass-through` | Emit the original key unchanged |
+| `exec "<program>"` | Raise an existing window of the app, or launch it |
+| `wm action="<...>"` | Window-manager action (see below) |
 
-The `wm` step performs a window-manager action on the foreground window:
+`keys` and `exec` accept per-OS targets; a positional string is the default:
+
+```kdl
+bind "s+M+b" { exec windows="brave.exe" linux="brave-browser"; }
+bind "s+x"   { keys windows="C+esc"; exec linux="rofi.sh"; }
+```
+
+`exec` is split into a command and arguments shell-style, so an argument that
+contains spaces must be quoted. KDL has no single-quoted strings (wrapping the
+whole value in `'...'` silently mis-parses), so the value itself is always a
+KDL double-quoted or raw string. Quote the spaced argument *inside* it, either
+with single quotes in a normal string, or double quotes in a raw `#"..."#`
+string:
+
+```kdl
+bind "s+g" { exec linux="raise-or-run.sh -w 'Brave-browser:Google Scholar' -c run.sh"; }
+bind "s+g" { exec linux=#"raise-or-run.sh -w "Brave-browser:Google Scholar" -c run.sh"#; }
+```
+
+### Window management (`wm`)
 
 | `action=` | Extra properties | Effect |
 |---|---|---|
-| `adjust` | `dx` `dy` `dw` `dh` (pixels, default `0`) | Move by `(dx, dy)` and resize by `(dw, dh)`. |
-| `preset` | `w` `h` (fractions `0` to `1`); optional `anchor=` | Size to a fraction of the work area, placed at `anchor` (`top-left`/`top-right`/`bottom-left`/`bottom-right`, default centred). |
-| `center` | (none) | Centre on the monitor, keeping the current size. |
-| `snap` | `to=` `top-left`/`top-right`/`bottom-left`/`bottom-right` | Move to a corner, keeping the current size. |
-| `corner` | `to=` `top-left`/`top-right`/`bottom-left`/`bottom-right` | Tile to a quarter of the work area. |
-| `smart-tile` | `to=` `left`/`right`/`top`/`bottom` | Tile that edge, cycling ½ → ⅓ → ⅔ on consecutive tiles of the same edge (any other action resets it to a half). |
-| `maximize` | (none) | Maximize. |
-| `maximize-toggle` | (none) | Maximize if restored, restore if maximized. |
-| `minimize` | (none) | Minimize (iconify) the window. |
-| `always-on-top` | (none) | Toggle the window's always-on-top (keep-above) state. |
-| `show-desktop` | (none) | Toggle showing the desktop (minimize/restore all windows). |
-| `move-to-monitor` | `to=` `next`/`prev` | Move the window to the next/previous monitor, keeping its relative place. |
-| `cycle-same-app` | `direction=` `forward`/`backward` (default `forward`) | Activate the next/previous window of the same application. |
-| `workspace` | `to=` `prev`/`next`/`<n>` | Switch to a workspace (`<n>` is 1-based). |
-| `move-to-workspace` | `to=` `prev`/`next`/`<n>` | Move the active window to a workspace and follow it. |
+| `adjust` | `dx` `dy` `dw` `dh` (pixels) | Move/resize by delta |
+| `preset` | `w` `h` (0–1 fractions); `anchor=` | Size to fraction of work area, optionally anchored to a corner |
+| `center` | | Centre on monitor, keeping size |
+| `snap` | `to=` corner | Move to corner, keeping size |
+| `corner` | `to=` corner | Tile to a quarter of the work area |
+| `smart-tile` | `to=` `left`/`right`/`top`/`bottom` | Tile to half, cycling ½→⅓→⅔ on repeats |
+| `maximize` / `maximize-toggle` / `minimize` | | |
+| `always-on-top` / `show-desktop` | | |
+| `move-to-monitor` | `to=` `next`/`prev` | Move window to adjacent monitor |
+| `cycle-same-app` | `direction=` `forward`/`backward` | Cycle windows of the same app |
+| `workspace` | `to=` `prev`/`next`/`<n>` | Switch workspace |
+| `move-to-workspace` | `to=` `prev`/`next`/`<n>` | Move window to workspace |
 
-Virtual desktops work on both platforms, Linux via EWMH, Windows via the
-virtual-desktop COM API. **On Windows this requires Windows 11 ≥ 24H2** (build
-26100.2605); on older builds the `workspace`/`move-to-workspace` actions log a
-warning and do nothing.
+Corners: `top-left` `top-right` `bottom-left` `bottom-right`.
 
-```kdl
-bind "s+M+b" { exec "brave.exe"; }                   // launch or focus Brave
-bind "Hyper+y" { wm action="adjust" dx=-30; }        // nudge window left
-bind "Hyper+6" { wm action="preset" w=0.6 h=0.75; }  // centred 60% × 75%
-bind "M+f10" { wm action="maximize-toggle"; }
-```
+### Modifiers and key names
 
-`keys` and `exec` can each give **per-OS targets** so one binding
-serves every platform, the combo is written once (keeping keymaps consistent),
-and the target is chosen by the running OS. A positional string is the default;
-`windows=`/`linux=`/`macos=` override it. A step that names only other OSes is
-dropped, and the binding still applies as long as some step remains, so one
-bind can pair a Windows-only step with a Linux-only one.
-
-```kdl
-bind "s+M+b" { exec windows="brave.exe" linux="brave-browser"; }  // per-OS launch
-bind "s+M+x" { exec linux="code-insiders"; }                      // Linux only
-bind "C+s+a" { keys windows="C+a" linux="C+q"; }                  // per-OS remap
-bind "s+x"   { keys windows="C+esc"; exec linux="rofi.sh"; }      // Win keystroke / Linux exec
-```
-
-> **Note:** `exec` launches at this process's integrity level. If RightKeys runs
-> elevated, launched apps are elevated too, run it un-elevated if that matters.
-
-### Combos and modifiers
-
-A combo is `Mod+Mod+...+key`, e.g. `C+M+s+S+a` (Ctrl+Alt+Super+Shift+A).
-Modifier prefixes are the Emacs-style letters and are **case-sensitive** (note
-`S` = Shift vs `s` = Super):
+Combo syntax: `Mod+Mod+key`, e.g. `C+M+s+a`. Prefixes are case-sensitive:
 
 | Prefix | Modifier |
 |---|---|
 | `C` | Control |
 | `M` | Alt |
 | `S` | Shift |
-| `s` | Super / Windows key |
-| `Hyper` | Synthetic, tracked internally, never sent to the OS (map it to real combos) |
+| `s` | Super / Win |
+| `Hyper` | Synthetic (tracked internally, never sent to the OS) |
 
-### Key names
-
-Letters, digits, and punctuation keys are named by the literal glyph they
-produce unshifted; the rest use descriptive, platform-neutral names. Each key
-has exactly one name. Because `+` (not `-`) separates a combo, symbol keys need
-no escaping, e.g. `C+-`, `C+S+=`, `s+/`.
-
-- **Letters:** `a` `b` `c` `d` `e` `f` `g` `h` `i` `j` `k` `l` `m` `n` `o` `p` `q` `r` `s` `t` `u` `v` `w` `x` `y` `z`
-- **Digits:** `0`-`9`
-- **Editing:** `backspace` `delete` `enter` `esc` `space` `tab`
-- **Navigation:** `up` `down` `left` `right` `home` `end` `page_up` `page_down`
-- **Punctuation:** `-` `=` `[` `]` `\` `;` `'` `,` `.` `/` `` ` `` (in KDL, write the backslash key as `"\\"`)
-- **Function:** `f1`-`f12`
-- **Media / system:** `volumeup` `volumedown` `mute` `playpause` `nextsong` `previoussong` `capslock` `pause` `scrolllock` `printscreen`
-- **Modifier keys:** `left_ctrl` `right_ctrl` `left_shift` `right_shift` `left_alt` `right_alt` `left_meta` `right_meta` `left_hyper` `right_hyper`
-
-### Application matching
-
-`application` / `application-not` are regular expressions matched against the
-active window: the X11 `WM_CLASS` on Linux (find it with `xprop WM_CLASS`), or
-the process name on Windows (e.g. `firefox`).
-
-### Live reload
-
-Config edits apply automatically, no restart needed:
-
-- A successful reload shows a "RightKeys reloaded!" notification.
-- An invalid edit is rejected and the running config kept, so a typo can't
-  strand your keyboard.
+Key names: letters `a`-`z`, digits `0`-`9`, punctuation by unshifted glyph
+(`-` `=` `[` `]` `\` `;` `'` `,` `.` `/` `` ` ``; write backslash as `"\\"`),
+editing (`backspace` `delete` `enter` `esc` `space` `tab`), navigation
+(`up` `down` `left` `right` `home` `end` `page_up` `page_down`),
+function keys `f1`-`f12`, media (`volumeup` `volumedown` `mute` `playpause`
+`nextsong` `previoussong`), and modifier keys (`left_ctrl` `right_ctrl`
+`left_shift` `right_shift` `left_alt` `right_alt` `left_meta` `right_meta`
+`left_hyper` `right_hyper`).
 
 ## Notes
 
-- Linux support is X11 only (no Wayland yet).
-- On Windows, some games that read raw input bypass the remapper, and remapping
-  inside elevated windows requires running elevated.
+- Linux: X11 only (no Wayland).
+- Windows: raw-input games bypass the remapper; remapping inside elevated
+  windows requires running elevated.
 
 ## Acknowledgments
 
-This project is inspired by the awesome [xkeysnail](https://github.com/mooz/xkeysnail).
+Inspired by [xkeysnail](https://github.com/mooz/xkeysnail) and [Vimium](https://github.com/philc/vimium).
 
 ## License
 

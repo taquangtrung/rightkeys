@@ -78,7 +78,7 @@ keymap name="Hyper layer" {
     bind "Hyper+`" { wm action="cycle-same-app" direction="forward"; }
     // Vimium-style window picker: shows a hint label on every window; type the
     // hint to focus it. Backspace edits the prefix; Escape cancels. Linux only.
-    bind "Hyper+/" { wm action="find-window"; }
+    bind "Hyper+/" { wm action="pick-window"; }
 }
 
 // App launchers — one binding per combo, with per-OS program targets. A combo
@@ -90,6 +90,9 @@ keymap name="Launchers" {
     // One bind, different action per OS: Windows opens the Start menu (a
     // keystroke), Linux runs an app launcher.
     bind "s+x" { keys windows="C+esc"; exec linux="rofi-launchpad.sh"; }
+    // exec is split shell-style: quote an argument that contains spaces. Use
+    // single quotes inside the KDL string (the double quotes are KDL's).
+    bind "s+g" { exec linux="raise-or-run.sh -w 'Brave-browser:Google Scholar' -c run-google-scholar.sh"; }
 }
 
 // Per-app keymap example: in browsers, make Alt+j/k scroll by page.
