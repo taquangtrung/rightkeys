@@ -226,11 +226,18 @@ pub const STEP_DIVISOR: i32 = 30;
 /// in addition to any user-listed `pass-through` entries, so focusing a VM
 /// "just works" without per-machine config.
 ///
+/// Screen lockers and login greeters are included too: rightkeys captures keys
+/// at the evdev/kernel level, so without this it would run the remapping engine
+/// over a lock-screen password (transforming characters via modmaps/tap-hold and
+/// adding per-key X11 round-trip latency). Passing these through raw keeps the
+/// password field responsive and unmodified.
+///
 /// The set differs per OS because the match target differs: on Linux it is the
 /// X11 `WM_CLASS`; on Windows it is the focused window's process-name stem. The
 /// macOS set is added when that platform is supported.
 #[cfg(target_os = "linux")]
 const DEFAULT_PASS_THROUGH_CLASSES: &[&str] = &[
+    // VM / remote desktop guests
     "gnome-boxes",
     "looking-glass",
     "qemu",
@@ -240,6 +247,17 @@ const DEFAULT_PASS_THROUGH_CLASSES: &[&str] = &[
     "virt-viewer",
     "virtualbox",
     "vmware",
+    // Screen lockers and login greeters — forward password input unmodified.
+    "light-locker",
+    "xscreensaver",
+    "gnome-screensaver",
+    "xsecurelock",
+    "slock",
+    "i3lock",
+    "kscreenlocker",
+    "lightdm-greeter",
+    "gdm",
+    "sddm-greeter",
 ];
 
 #[cfg(windows)]
